@@ -33,6 +33,11 @@ class ZoneController:
         self._thermal_models: dict[str, ThermalObserver] = {}
         self._last_seen_temps: dict[str, float] = {}
 
+        # Selected rate estimator (see rate_estimators.py); anything but a string means "default"
+        estimator_name = getattr(coordinator, "rate_estimator", None)
+        if not isinstance(estimator_name, str):
+            estimator_name = None
+
         for zone in self.zones:
             name = zone.get(CONF_ZONE_NAME)
             if not name:
@@ -43,7 +48,7 @@ class ZoneController:
                 kp=100.0, ki=0.0, kd=0.0, out_min=0.0, out_max=100.0, sensor_timeout=7200.0
             )
             self._autotuners[climate_id] = PassiveAutotuneObserver(climate_id, required_cycles=3)
-            self._thermal_models[climate_id] = ThermalObserver(climate_id)
+            self._thermal_models[climate_id] = ThermalObserver(climate_id, estimator=estimator_name)
 
         self._was_dhw_active: bool = False
 
@@ -105,6 +110,27 @@ class ZoneController:
         """Save thermal model learning progress to storage."""
         if hasattr(self.coordinator, "storage"):
             await self.coordinator.storage.async_save_thermal_states(self._thermal_models)
+
+    def set_rate_estimator(self, name: str | None) -> None:
+        """Switch every zone's thermal observer to another rate estimator."""
+        for model in self._thermal_models.values():
+            model.set_estimator(name)
+
+    def _outdoor_temp(self) -> float | None:
+        """Outdoor temperature from the configured weather entity/sensor, or None if unavailable."""
+        sensor_id = getattr(self.coordinator, "weather_sensor_id", None)
+        if not isinstance(sensor_id, str) or not sensor_id:
+            return None
+        state = self.hass.states.get(sensor_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            if getattr(state, "domain", None) == "weather":
+                raw = state.attributes.get("temperature")
+                return float(raw) if raw is not None else None
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
 
     async def async_update_zone(self, entity_id: str, new_state: Any) -> float:
         """Calculate and update PID demand, autotuner and thermal model for a zone."""
@@ -201,48 +227,36 @@ class ZoneController:
                 except (ValueError, TypeError):
                     curve_val = 0.0
                 if self.coordinator.weather_sensor_id:
-                    weather_state = self.hass.states.get(self.coordinator.weather_sensor_id)
-                    if weather_state and weather_state.state not in ("unavailable", "unknown"):
-                        try:
-                            outdoor_temp = None
-                            if getattr(weather_state, "domain", None) == "weather":
-                                temp_attr = weather_state.attributes.get("temperature")
-                                if temp_attr is not None:
-                                    outdoor_temp = float(temp_attr)
-                            else:
-                                outdoor_temp = float(weather_state.state)
+                    outdoor_temp = self._outdoor_temp()
+                    if outdoor_temp is not None:
+                        # Adaptive Curve Calculation (SAT Math)
+                        curve_val = thermal_model.get_weather_multiplier(manual_base_curve=curve_val)
 
-                            if outdoor_temp is not None:
-                                # Adaptive Curve Calculation (SAT Math)
-                                curve_val = thermal_model.get_weather_multiplier(manual_base_curve=curve_val)
+                        # (Target - OutdoorTemp) * Ke
+                        delta_t = effective_target - outdoor_temp
+                        if delta_t > 0.0 and curve_val > 0.0:
+                            ff_demand = delta_t * curve_val
+                            # Clamp the weather bonus to a max of +40% to avoid it dominating the PID
+                            ff_demand = min(40.0, ff_demand)
 
-                                # (Target - OutdoorTemp) * Ke
-                                delta_t = effective_target - outdoor_temp
-                                if delta_t > 0.0 and curve_val > 0.0:
-                                    ff_demand = delta_t * curve_val
-                                    # Clamp the weather bonus to a max of +40% to avoid it dominating the PID
-                                    ff_demand = min(40.0, ff_demand)
-                                    
-                                    # Scale down FF as we approach or exceed effective_target to prevent ghost heating
-                                    overheat = current_temp - effective_target
-                                    if overheat >= 0:
-                                        ff_demand = 0.0
-                                    elif overheat > -0.5:
-                                        ff_factor = max(0.0, -overheat / 0.5)
-                                        ff_demand *= ff_factor
-                                        
-                                    demand = min(100.0, max(0.0, demand + ff_demand))
-                                    _LOGGER.debug(
-                                        "[%s] SAT Weather Comp: Target=%.1f, Outdoor=%.1f, Ke=%.2f, FF=+%.1f%%, Final=%.1f%%",
-                                        entity_id,
-                                        effective_target,
-                                        outdoor_temp,
-                                        curve_val,
-                                        ff_demand,
-                                        demand,
-                                    )
-                        except (ValueError, TypeError):
-                            pass
+                            # Scale down FF as we approach or exceed effective_target to prevent ghost heating
+                            overheat = current_temp - effective_target
+                            if overheat >= 0:
+                                ff_demand = 0.0
+                            elif overheat > -0.5:
+                                ff_factor = max(0.0, -overheat / 0.5)
+                                ff_demand *= ff_factor
+
+                            demand = min(100.0, max(0.0, demand + ff_demand))
+                            _LOGGER.debug(
+                                "[%s] SAT Weather Comp: Target=%.1f, Outdoor=%.1f, Ke=%.2f, FF=+%.1f%%, Final=%.1f%%",
+                                entity_id,
+                                effective_target,
+                                outdoor_temp,
+                                curve_val,
+                                ff_demand,
+                                demand,
+                            )
         else:
             demand = 0.0
 
@@ -264,7 +278,9 @@ class ZoneController:
                 await self.async_save_autotuner_states()
 
         # Feed Thermal Observer
-        self._thermal_models[entity_id].update(current_temp, demand > 0)
+        self._thermal_models[entity_id].update(
+            current_temp, demand > 0, outdoor_temp=self._outdoor_temp()
+        )
         # Debounced save: avoid writing to disk on every state change (SD card wear)
         if hasattr(self.coordinator, "storage"):
             self.coordinator.debounced_save_thermal_states(self._thermal_models)

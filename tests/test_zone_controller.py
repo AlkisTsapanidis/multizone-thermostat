@@ -118,6 +118,31 @@ def test_zone_controller_init():
     print("test_zone_controller_init PASSED")
 
 
+def test_zone_controller_selects_rate_estimator_from_coordinator():
+    from custom_components.multizone_thermostat import rate_estimators
+    from custom_components.multizone_thermostat.rate_estimators import LegacyEmaEstimator
+
+    class Marker(LegacyEmaEstimator):
+        pass
+
+    rate_estimators.register_estimator("marker", Marker)
+    try:
+        cid = make_zone_entity_id("Living Room")
+
+        coordinator, _ = create_mock_coordinator()
+        coordinator.rate_estimator = "marker"
+        zc = ZoneController(MagicMock(), coordinator)
+        assert type(zc.get_thermal_model(cid).estimator) is Marker
+        assert zc.get_thermal_model(cid).estimator_name == "marker"
+
+        # Unset (MagicMock attribute, not a string) -> default estimator
+        coordinator, _ = create_mock_coordinator()
+        zc = ZoneController(MagicMock(), coordinator)
+        assert type(zc.get_thermal_model(cid).estimator) is LegacyEmaEstimator
+    finally:
+        rate_estimators._REGISTRY.pop("marker", None)
+
+
 def test_zone_controller_load_state():
     hass = MagicMock()
     coordinator, _ = create_mock_coordinator()
@@ -263,6 +288,26 @@ async def test_zone_controller_smart_pid_and_weather_comp():
     assert demands[cid] == res
     coordinator.debounced_save_thermal_states.assert_called_once()
     print("test_zone_controller_smart_pid_and_weather_comp PASSED")
+
+
+async def test_zone_controller_feeds_outdoor_temp_to_estimator():
+    hass = MagicMock()
+    coordinator, _ = create_mock_coordinator()
+    cid = make_zone_entity_id("Living Room")
+    coordinator.weather_sensor_id = "weather.home"
+    hass.states.get = MagicMock(
+        return_value=DummyState("sunny", target_temp=7.5, domain="weather")
+    )
+
+    zc = ZoneController(hass, coordinator)
+    seen = []
+    zc.get_thermal_model(cid).estimator.set_outdoor = seen.append
+    await zc.async_update_zone(cid, DummyState("heat", current_temp=19.0, target_temp=20.0))
+    assert seen == [7.5]
+
+    hass.states.get = MagicMock(return_value=DummyState("unavailable", domain="weather"))
+    await zc.async_update_zone(cid, DummyState("heat", current_temp=19.0, target_temp=20.0))
+    assert seen == [7.5, None]
 
 
 async def main():

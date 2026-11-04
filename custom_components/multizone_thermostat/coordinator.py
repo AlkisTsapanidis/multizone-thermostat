@@ -35,6 +35,7 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CONF_BOILER_SWITCH,
     CONF_BOILER_MODE,
+    CONF_RATE_ESTIMATOR,
     MODE_RELAY,
     MODE_OPENTHERM,
     CONF_OPENTHERM_ENTITY,
@@ -91,8 +92,10 @@ from .const import (
     CONF_WEATHER_SENSOR,
     KEY_WEATHER_CURVE,
     KEY_DEMAND_STRATEGY,
+    KEY_RATE_ESTIMATOR,
 )
 from .demand_aggregator import VALID_DEMAND_STRATEGIES
+from .rate_estimators import available_estimators
 from .pwm_engine import PWMEngine
 from .thermal_model import ThermalObserver
 from .calendar_parser import parse_calendar_event, CalendarOverride
@@ -125,6 +128,7 @@ class MultizoneCoordinator:
         options = getattr(entry, "options", None) or {}
         config = {**(entry.data or {}), **(options if isinstance(options, dict) else {})}
         self.boiler_mode = config.get(CONF_BOILER_MODE, MODE_RELAY)
+        self.rate_estimator = config.get(CONF_RATE_ESTIMATOR)
         self.boiler_switch = config.get(CONF_BOILER_SWITCH)
         self.opentherm_entity = config.get(CONF_OPENTHERM_ENTITY)
         self.opentherm_min_temp = config.get(CONF_OPENTHERM_MIN_TEMP, 35.0)
@@ -336,6 +340,13 @@ class MultizoneCoordinator:
 
 
 
+    async def async_set_rate_estimator(self, name: str) -> None:
+        """Switch the heating/cooling rate estimator for all zones and persist the choice."""
+        self.rate_estimator = name
+        self.zone_controller.set_rate_estimator(name)
+        await self.async_set_persistent_data(KEY_RATE_ESTIMATOR, name)
+        await self.zone_controller.async_save_thermal_states()
+
     def debounced_save_thermal_states(self, thermal_models) -> None:
         if hasattr(self, "storage") and self.storage:
             self.storage.debounced_save_thermal_states(thermal_models)
@@ -369,6 +380,12 @@ class MultizoneCoordinator:
 
         if self._settings.get(KEY_DEMAND_STRATEGY) in VALID_DEMAND_STRATEGIES:
             self.demand_aggregator.strategy = self._settings[KEY_DEMAND_STRATEGY]
+
+        # A rate estimator picked in the UI overrides the config-entry value
+        saved_estimator = self._settings.get(KEY_RATE_ESTIMATOR)
+        if isinstance(saved_estimator, str) and saved_estimator in available_estimators():
+            self.rate_estimator = saved_estimator
+            self.zone_controller.set_rate_estimator(saved_estimator)
             
         # Always load stored state into ZoneManager (even if settings_stored is empty)
         saved_zone_modes = self._settings.get("zone_modes", {})
