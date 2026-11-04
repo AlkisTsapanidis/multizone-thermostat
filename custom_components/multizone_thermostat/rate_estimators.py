@@ -144,6 +144,13 @@ for _name, _requires in _SOLVER_REQUIRES.items():
     register_estimator(_name, _solver_factory(_name, _requires))
 
 
+def usable_estimators() -> list[str]:
+    """Registered estimators whose third-party dependencies are installed, default first."""
+    names = [n for n in available_estimators()
+             if all(importlib.util.find_spec(m) for m in _SOLVER_REQUIRES.get(n, ()))]
+    return sorted(names, key=lambda n: (n != DEFAULT_RATE_ESTIMATOR, n))
+
+
 def available_estimators() -> list[str]:
     return sorted(_REGISTRY)
 

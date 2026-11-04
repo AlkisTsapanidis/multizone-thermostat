@@ -111,6 +111,11 @@ class ZoneController:
         if hasattr(self.coordinator, "storage"):
             await self.coordinator.storage.async_save_thermal_states(self._thermal_models)
 
+    def set_rate_estimator(self, name: str | None) -> None:
+        """Switch every zone's thermal observer to another rate estimator."""
+        for model in self._thermal_models.values():
+            model.set_estimator(name)
+
     def _outdoor_temp(self) -> float | None:
         """Outdoor temperature from the configured weather entity/sensor, or None if unavailable."""
         sensor_id = getattr(self.coordinator, "weather_sensor_id", None)

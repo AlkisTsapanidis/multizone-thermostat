@@ -36,11 +36,7 @@ class ThermalObserver:
         self.temp_delta_threshold = temp_delta_threshold
 
         if isinstance(estimator, str) or estimator is None:
-            self.estimator_name = estimator or DEFAULT_RATE_ESTIMATOR
-            if self.estimator_name == "legacy":
-                self.estimator: RateEstimator = LegacyEmaEstimator(zone_id, temp_delta_threshold)
-            else:
-                self.estimator = create_estimator(self.estimator_name, zone_id)
+            self._select_estimator(estimator)
         else:
             self.estimator = estimator
             self.estimator_name = getattr(estimator, "name", type(estimator).__name__)
@@ -55,6 +51,21 @@ class ThermalObserver:
         self._max_temp_after_shutdown = None
 
         self.thermal_inertia = 0.0  # °C overshoot
+
+    def _select_estimator(self, name: "str | None") -> None:
+        self.estimator_name = name or DEFAULT_RATE_ESTIMATOR
+        if self.estimator_name == "legacy":
+            self.estimator: RateEstimator = LegacyEmaEstimator(self.zone_id, self.temp_delta_threshold)
+        else:
+            self.estimator = create_estimator(self.estimator_name, self.zone_id)
+
+    def set_estimator(self, name: "str | None") -> None:
+        """Switch to another registered estimator. Learned rates restart from scratch (they are
+        not comparable between algorithms); inertia is kept."""
+        if (name or DEFAULT_RATE_ESTIMATOR) == self.estimator_name:
+            return
+        self._select_estimator(name)
+        self._seen_sample = False
 
     @property
     def heating_rate(self) -> float:

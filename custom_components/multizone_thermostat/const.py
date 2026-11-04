@@ -43,6 +43,7 @@ DEFAULT_ZONE_WEIGHT = 1.0
 CONF_ZONE_AUTHORITATIVE_SYNC = "authoritative_climate_sync"
 DEFAULT_AUTHORITATIVE_SYNC = False
 KEY_DEMAND_STRATEGY = "demand_strategy"
+KEY_RATE_ESTIMATOR = "rate_estimator"
 CONF_GLOBAL_CALENDAR = "global_calendar"
 
 # Geofencing keys

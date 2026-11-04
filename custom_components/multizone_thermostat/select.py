@@ -7,6 +7,7 @@ from homeassistant.components.climate import HVACMode
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -21,11 +22,13 @@ from .const import (
     ZONE_MODE_BYPASS,
     CONF_ZONE_NAME,
     KEY_DEMAND_STRATEGY,
+    KEY_RATE_ESTIMATOR,
     make_zone_entity_id,
     make_via_device_kwargs,
 )
 from .coordinator import MultizoneCoordinator
 from .demand_aggregator import VALID_DEMAND_STRATEGIES, DEMAND_STRATEGY_MAX
+from .rate_estimators import DEFAULT_RATE_ESTIMATOR, usable_estimators
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +44,7 @@ async def async_setup_entry(
     entities: list[SelectEntity] = [
         MultizoneGlobalPresetSelect(coordinator, entry.entry_id),
         MultizoneDemandStrategySelect(coordinator, entry.entry_id),
+        MultizoneRateEstimatorSelect(coordinator, entry.entry_id),
         MultizoneScheduleProfileSelect(coordinator, entry.entry_id),
     ]
     
@@ -173,6 +177,63 @@ class MultizoneDemandStrategySelect(RestoreEntity, SelectEntity):
             self._coordinator._select_entities.pop("demand_strategy", None)
         if hasattr(self._coordinator, "_selects"):
             self._coordinator._selects.pop("demand_strategy", None)
+
+
+class MultizoneRateEstimatorSelect(RestoreEntity, SelectEntity):
+    """Selects the algorithm used to learn each zone's heating and cooling rates."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "rate_estimator"
+    _attr_icon = "mdi:thermometer-lines"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: MultizoneCoordinator, entry_id: str) -> None:
+        self._coordinator = coordinator
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{DOMAIN}_{entry_id}_rate_estimator"
+        self._attr_options = usable_estimators()
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._entry_id)},
+            name="Master Control",
+            manufacturer="Custom Integration",
+            model="Master Control",
+        )
+
+    @property
+    def options(self) -> list[str]:
+        return self._attr_options
+
+    @property
+    def current_option(self) -> str:
+        current = getattr(self._coordinator, "rate_estimator", None)
+        return current if current in self.options else DEFAULT_RATE_ESTIMATOR
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the saved choice (the coordinator normally applied it while loading storage)."""
+        await super().async_added_to_hass()
+        saved = self._coordinator.get_persistent_data(KEY_RATE_ESTIMATOR)
+        if saved not in self.options:
+            last_state = await self.async_get_last_state()
+            saved = last_state.state if last_state is not None else None
+        if saved in self.options and saved != self.current_option:
+            await self._coordinator.async_set_rate_estimator(saved)
+        self._coordinator.register_select("rate_estimator", self)
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in self.options:
+            _LOGGER.warning("Invalid rate estimator: %s", option)
+            return
+        await self._coordinator.async_set_rate_estimator(option)
+        self.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        if hasattr(self._coordinator, "_select_entities"):
+            self._coordinator._select_entities.pop("rate_estimator", None)
+        if hasattr(self._coordinator, "_selects"):
+            self._coordinator._selects.pop("rate_estimator", None)
 
 
 class MultizoneZoneSelect(RestoreEntity, SelectEntity):

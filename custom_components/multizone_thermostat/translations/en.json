@@ -349,7 +349,25 @@
                     "weighted_average": "Weighted Average",
                     "sum_capped": "Cumulative Sum (Capped 100%)"
                 }
-            }
+            },
+      "rate_estimator": {
+        "name": "Heating/Cooling Rate Estimator",
+        "state": {
+          "legacy": "Legacy (EMA, original)",
+          "trend": "Trend filter (percentile)",
+          "trend_idle": "Trend filter + idle blocks",
+          "rt_kalman": "Real-time Kalman",
+          "rt_physical": "Real-time physical model (uses outdoor temperature)",
+          "rt_rls": "Real-time recursive least squares",
+          "rt_theilsen": "Real-time Theil-Sen",
+          "b_savgol": "Batch Savitzky-Golay",
+          "b_spline": "Batch smoothing spline",
+          "b_perperiod": "Batch per-period least squares",
+          "b_hampel_ts": "Batch Hampel + Theil-Sen",
+          "b_gp": "Batch Gaussian process",
+          "b_rts": "Batch RTS smoother"
+        }
+      }
         }
     }
 }

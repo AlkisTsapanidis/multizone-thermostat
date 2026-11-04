@@ -155,6 +155,60 @@ async def test_demand_strategy_select_restore_and_removal():
 
 
 # =====================================================================
+# Rate estimator select (Master Control)
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_rate_estimator_select_switches_and_persists():
+    from custom_components.multizone_thermostat.select import MultizoneRateEstimatorSelect
+    from custom_components.multizone_thermostat.zone_controller import ZoneController
+    from custom_components.multizone_thermostat.const import KEY_RATE_ESTIMATOR
+
+    settings: dict = {}
+    coordinator = MagicMock()
+    coordinator.zones = [{CONF_ZONE_NAME: "Living"}]
+    coordinator.rate_estimator = None
+    coordinator.zone_controller = ZoneController(MagicMock(), coordinator)
+    coordinator.zone_controller.async_save_thermal_states = AsyncMock()
+    coordinator._select_entities = {}
+    coordinator.get_persistent_data = lambda k, default=None: settings.get(k, default)
+    coordinator.register_select = lambda k, ent: coordinator._select_entities.__setitem__(k, ent)
+
+    async def fake_set(key, val):
+        settings[key] = val
+
+    async def set_estimator(name):
+        coordinator.rate_estimator = name
+        coordinator.zone_controller.set_rate_estimator(name)
+        await fake_set(KEY_RATE_ESTIMATOR, name)
+
+    coordinator.async_set_rate_estimator = set_estimator
+
+    ent = MultizoneRateEstimatorSelect(coordinator, "entry_123")
+    ent.async_write_ha_state = MagicMock()
+    assert ent.current_option == "legacy"
+    assert ent.options[0] == "legacy" and "rt_kalman" in ent.options
+
+    await ent.async_select_option("rt_kalman")
+    model = coordinator.zone_controller.get_thermal_model(make_zone_entity_id("Living"))
+    assert model.estimator_name == "rt_kalman"
+    assert ent.current_option == "rt_kalman"
+    assert settings[KEY_RATE_ESTIMATOR] == "rt_kalman"
+
+    await ent.async_select_option("nonsense")
+    assert ent.current_option == "rt_kalman"
+
+    # restore from persistent storage on startup
+    coordinator.rate_estimator = None
+    coordinator.zone_controller.set_rate_estimator("legacy")
+    ent2 = MultizoneRateEstimatorSelect(coordinator, "entry_123")
+    await ent2.async_added_to_hass()
+    assert model.estimator_name == "rt_kalman"
+    assert coordinator._select_entities["rate_estimator"] is ent2
+
+
+# =====================================================================
 # 2. Phase 10 & Phase 8 — Dynamic Weather Curve & OpenTherm Telemetry
 # =====================================================================
 
