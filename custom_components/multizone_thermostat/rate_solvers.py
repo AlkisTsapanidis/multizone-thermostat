@@ -377,3 +377,72 @@ class PhysicalKalmanEstimator(KalmanEstimator):
             return
         self.cooling_rate = max(0.0, -(a - k * delta))
         self.heating_rate = max(0.0, a - k * delta + b)
+
+
+# ----------------------------------------------------------------------------- naive trend filter
+
+def extract_true_thermal_rates(timestamps, values):
+    """Total-variation trend filter of a raw series; returns (heating, cooling) in °C/h.
+
+    Takes the 99th/1st percentile of the derivative, which picks noise extremes, so it overestimates.
+    Kept as a reference candidate; prefer trend_idle.
+    """
+    from derivative import dxdt
+
+    t = np.array(timestamps, dtype=float)
+    x = np.array(values, dtype=float)
+    if len(t) < 10:
+        return 0.0, 0.0
+    try:
+        raw = dxdt(x, t, kind="trend_filtered", order=0, alpha=3e-2)
+    except Exception:
+        raw = dxdt(x, t, kind="spline", s=len(x) * 0.5, order=2, d=1)
+    rates_per_hour = raw * 3600
+    return (max(0.0, np.percentile(rates_per_hour, 99.0)),
+            abs(min(0.0, np.percentile(rates_per_hour, 1.0))))
+
+
+class TrendFilteredEstimator:
+    """Streaming wrapper that re-runs extract_true_thermal_rates() on a trailing 12 h window."""
+
+    window_s = 12 * 3600
+    refit_s = 6 * 3600
+
+    def __init__(self, zone_id: str):
+        self.zone_id = zone_id
+        self._t: list[float] = []
+        self._x: list[float] = []
+        self._last_fit: float | None = None
+        self.heating_rate = 0.0
+        self.cooling_rate = 0.0
+
+    def update(self, ts: datetime, temp: float, is_heating: bool) -> None:
+        now = ts.timestamp()
+        self._t.append(now)
+        self._x.append(temp)
+        drop = 0
+        while self._t[drop] < now - self.window_s:
+            drop += 1
+        if drop:
+            del self._t[:drop], self._x[:drop]
+        if self._last_fit is None or now - self._last_fit >= self.refit_s:
+            self._last_fit = now
+            self.heating_rate, self.cooling_rate = extract_true_thermal_rates(self._t, self._x)
+
+
+# name -> (class, third-party modules it needs at runtime). numpy ships with Home Assistant;
+# scipy and derivative do not and are therefore optional.
+SOLVERS = {
+    "trend": (TrendFilteredEstimator, ("numpy", "derivative")),
+    "trend_idle": (TrendIdleEstimator, ("numpy", "derivative")),
+    "rt_kalman": (KalmanEstimator, ("numpy",)),
+    "rt_physical": (PhysicalKalmanEstimator, ("numpy",)),
+    "rt_rls": (RLSEstimator, ("numpy",)),
+    "rt_theilsen": (TheilSenWindowEstimator, ("numpy",)),
+    "b_savgol": (SavGolEstimator, ("numpy", "scipy")),
+    "b_spline": (SmoothingSplineEstimator, ("numpy", "scipy")),
+    "b_perperiod": (PerPeriodLSEstimator, ("numpy",)),
+    "b_hampel_ts": (HampelTheilSenEstimator, ("numpy", "scipy")),
+    "b_gp": (GaussianProcessEstimator, ("numpy",)),
+    "b_rts": (RTSSmootherEstimator, ("numpy",)),
+}

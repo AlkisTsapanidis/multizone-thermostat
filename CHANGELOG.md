@@ -5,7 +5,9 @@
 - New `rate_estimators.py` defines the estimator contract (`update(ts, temp, is_heating)`, `heating_rate`, `cooling_rate`, optional `dump_state`/`load_state`), a registry (`register_estimator`) and the original algorithm as `LegacyEmaEstimator`, which remains the default so behaviour is unchanged.
 - `ThermalObserver` now delegates rate learning to the selected estimator (inertia tracking and the weather multiplier are unchanged) and accepts an optional sample timestamp so history can be replayed. Select one with the `rate_estimator` config option.
 - Persisted thermal state records which estimator produced the rates; rates saved by a different estimator are discarded on load and relearned. Existing stored data is treated as `legacy`.
-- Added a replay harness (`tests/thermal_harness`) with recorded sensor data to compare estimators; see `CoolingRateImprovements.md`.
+- Added replay harness (`tests/thermal_harness`) with recorded sensor data to compare estimators; see `CoolingRateImprovements.md`.
+- Outdoor temperature from the configured weather sensor is now passed to the learner: `ThermalObserver.update(..., outdoor_temp=)` forwards it to any estimator exposing an optional `set_outdoor(temp | None)` hook (currently `rt_physical`, which models cooling as proportional to the indoor-outdoor delta). `ZoneController` reads the sensor once per update via a shared helper, also used by weather compensation.
+- All 12 candidate solvers now live in `rate_solvers.py` and are selectable via `rate_estimator`: `trend`, `trend_idle`, `rt_kalman`, `rt_physical`, `rt_rls`, `rt_theilsen`, `b_savgol`, `b_spline`, `b_perperiod`, `b_hampel_ts`, `b_gp`, `b_rts`. They need numpy; `b_savgol`, `b_spline` and `b_hampel_ts` also need scipy, and `trend`/`trend_idle` need `derivative`. These are not in `manifest.json`; if a dependency is missing the zone logs a warning and uses `legacy`.
 
 ## [6.0.1] - 2026-11-01
 ### Fix: UI Layout Polishing & Scheduler Navigation Robustness

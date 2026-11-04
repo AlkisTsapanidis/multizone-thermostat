@@ -20,6 +20,7 @@ installation with the `rate_estimator` option (default: `DEFAULT_RATE_ESTIMATOR`
 """
 from __future__ import annotations
 
+import importlib.util
 import logging
 from datetime import datetime
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -106,6 +107,41 @@ _REGISTRY: dict[str, EstimatorFactory] = {"legacy": LegacyEmaEstimator}
 def register_estimator(name: str, factory: EstimatorFactory) -> None:
     """Make an estimator selectable by name. `factory(zone_id)` must return a RateEstimator."""
     _REGISTRY[name] = factory
+
+
+def _solver_factory(name: str, requires: tuple[str, ...]) -> EstimatorFactory:
+    """Lazy factory: imports rate_solvers on first use and falls back if a dependency is missing."""
+
+    def factory(zone_id: str) -> RateEstimator:
+        missing = [m for m in requires if importlib.util.find_spec(m) is None]
+        if missing:
+            _LOGGER.warning("Rate estimator %r needs %s, which is not installed; using %r for %s",
+                            name, ", ".join(missing), DEFAULT_RATE_ESTIMATOR, zone_id)
+            return _REGISTRY[DEFAULT_RATE_ESTIMATOR](zone_id)
+        from . import rate_solvers
+        return rate_solvers.SOLVERS[name][0](zone_id)
+
+    return factory
+
+
+# Kept in sync with rate_solvers.SOLVERS (checked by tests); listed here so that importing this
+# module never pulls in numpy.
+_SOLVER_REQUIRES = {
+    "trend": ("numpy", "derivative"),
+    "trend_idle": ("numpy", "derivative"),
+    "rt_kalman": ("numpy",),
+    "rt_physical": ("numpy",),
+    "rt_rls": ("numpy",),
+    "rt_theilsen": ("numpy",),
+    "b_savgol": ("numpy", "scipy"),
+    "b_spline": ("numpy", "scipy"),
+    "b_perperiod": ("numpy",),
+    "b_hampel_ts": ("numpy", "scipy"),
+    "b_gp": ("numpy",),
+    "b_rts": ("numpy",),
+}
+for _name, _requires in _SOLVER_REQUIRES.items():
+    register_estimator(_name, _solver_factory(_name, _requires))
 
 
 def available_estimators() -> list[str]:

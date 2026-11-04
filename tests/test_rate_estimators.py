@@ -172,3 +172,69 @@ def test_estimator_without_persistence_hooks_still_works():
     assert "estimator_state" not in state
     obs.load_state(state)
     obs.update(20.0, False)  # default (now) timestamp works
+
+
+def test_observer_forwards_outdoor_temp_only_to_estimators_that_accept_it():
+    class WithOutdoor(StubEstimator):
+        def __init__(self, zone_id="z"):
+            super().__init__(zone_id)
+            self.outdoor = "unset"
+
+        def set_outdoor(self, outdoor):
+            self.outdoor = outdoor
+
+    est = WithOutdoor()
+    obs = ThermalObserver("z", estimator=est)
+    obs.update(20.0, False, at(0), outdoor_temp=3.0)
+    assert est.outdoor == 3.0
+    obs.update(20.0, False, at(1))
+    assert est.outdoor is None
+    # estimators without the hook (e.g. legacy) are unaffected
+    ThermalObserver("z").update(20.0, False, at(0), outdoor_temp=3.0)
+
+
+def test_physical_estimator_cooling_scales_with_outdoor_delta():
+    """With outdoor data rt_physical learns k and reports cooling proportional to indoor-outdoor delta."""
+    from custom_components.multizone_thermostat.rate_solvers import PhysicalKalmanEstimator
+
+    est = PhysicalKalmanEstimator("z")
+    temp, outdoor, k = 20.0, 5.0, 0.02  # 1/h
+    for minute in range(0, 4 * 24 * 60, 5):
+        est.set_outdoor(outdoor)
+        temp += -k * (temp - outdoor) * 5 / 60
+        est.update(at(minute), round(temp, 2), False)
+    assert est.cooling_rate == pytest.approx(k * (temp - outdoor), rel=0.5)
+
+
+# ---------------------------------------------------------------- numerical solvers
+
+def test_solver_registry_matches_rate_solvers_module():
+    from custom_components.multizone_thermostat import rate_solvers
+
+    assert {k: v[1] for k, v in rate_solvers.SOLVERS.items()} == rate_estimators._SOLVER_REQUIRES
+    assert set(rate_solvers.SOLVERS) <= set(available_estimators())
+
+
+@pytest.mark.parametrize("name", sorted(rate_estimators._SOLVER_REQUIRES))
+def test_every_solver_is_selectable_and_cools_sensibly(name):
+    """Each solver runs inside ThermalObserver on 2 days of a steady 0.3 C/h decline."""
+    obs = ThermalObserver("z", estimator=name)
+    assert obs.estimator_name == name
+    for minute in range(0, 48 * 60, 5):
+        obs.update(round(21.0 - 0.3 * minute / 60, 1), False, at(minute))
+    # rt_physical fits a Newtonian model that is unidentifiable without heating or outdoor data.
+    if name not in ("rt_physical", "trend"):
+        assert 0.05 <= obs.cooling_rate <= 1.0
+    assert obs.cooling_rate >= 0.0
+    state = obs.dump_state()
+    assert state["estimator"] == name
+
+
+def test_solver_with_missing_dependency_falls_back_to_legacy(monkeypatch, caplog):
+    real_find_spec = rate_estimators.importlib.util.find_spec
+    monkeypatch.setattr(rate_estimators.importlib.util, "find_spec",
+                        lambda m, *a: None if m == "derivative" else real_find_spec(m, *a))
+    with caplog.at_level("WARNING"):
+        est = create_estimator("trend_idle", "z")
+    assert isinstance(est, LegacyEmaEstimator)
+    assert "derivative" in caplog.text

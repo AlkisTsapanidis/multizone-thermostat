@@ -74,16 +74,21 @@ class ThermalObserver:
     def cooling_rate(self, value: float) -> None:
         self.estimator.cooling_rate = value
 
-    def update(self, current_temp: float, is_heating: bool, timestamp: datetime | None = None):
+    def update(self, current_temp: float, is_heating: bool, timestamp: datetime | None = None,
+               outdoor_temp: float | None = None):
         """Update the observer with the latest temperature and state.
 
         `timestamp` is the time the sample was taken (timezone-aware); defaults to now. Passing it
-        explicitly makes recorded history replayable.
+        explicitly makes recorded history replayable. `outdoor_temp` is forwarded to estimators that
+        implement the optional `set_outdoor(temp | None)` hook; others ignore it.
         """
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
         now = timestamp.timestamp()
 
+        set_outdoor = getattr(self.estimator, "set_outdoor", None)
+        if callable(set_outdoor):
+            set_outdoor(outdoor_temp)
         self.estimator.update(timestamp, current_temp, is_heating)
 
         if not self._seen_sample:

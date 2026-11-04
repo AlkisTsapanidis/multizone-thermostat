@@ -290,6 +290,26 @@ async def test_zone_controller_smart_pid_and_weather_comp():
     print("test_zone_controller_smart_pid_and_weather_comp PASSED")
 
 
+async def test_zone_controller_feeds_outdoor_temp_to_estimator():
+    hass = MagicMock()
+    coordinator, _ = create_mock_coordinator()
+    cid = make_zone_entity_id("Living Room")
+    coordinator.weather_sensor_id = "weather.home"
+    hass.states.get = MagicMock(
+        return_value=DummyState("sunny", target_temp=7.5, domain="weather")
+    )
+
+    zc = ZoneController(hass, coordinator)
+    seen = []
+    zc.get_thermal_model(cid).estimator.set_outdoor = seen.append
+    await zc.async_update_zone(cid, DummyState("heat", current_temp=19.0, target_temp=20.0))
+    assert seen == [7.5]
+
+    hass.states.get = MagicMock(return_value=DummyState("unavailable", domain="weather"))
+    await zc.async_update_zone(cid, DummyState("heat", current_temp=19.0, target_temp=20.0))
+    assert seen == [7.5, None]
+
+
 async def main():
     test_zone_controller_init()
     test_zone_controller_load_state()
