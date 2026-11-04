@@ -118,6 +118,31 @@ def test_zone_controller_init():
     print("test_zone_controller_init PASSED")
 
 
+def test_zone_controller_selects_rate_estimator_from_coordinator():
+    from custom_components.multizone_thermostat import rate_estimators
+    from custom_components.multizone_thermostat.rate_estimators import LegacyEmaEstimator
+
+    class Marker(LegacyEmaEstimator):
+        pass
+
+    rate_estimators.register_estimator("marker", Marker)
+    try:
+        cid = make_zone_entity_id("Living Room")
+
+        coordinator, _ = create_mock_coordinator()
+        coordinator.rate_estimator = "marker"
+        zc = ZoneController(MagicMock(), coordinator)
+        assert type(zc.get_thermal_model(cid).estimator) is Marker
+        assert zc.get_thermal_model(cid).estimator_name == "marker"
+
+        # Unset (MagicMock attribute, not a string) -> default estimator
+        coordinator, _ = create_mock_coordinator()
+        zc = ZoneController(MagicMock(), coordinator)
+        assert type(zc.get_thermal_model(cid).estimator) is LegacyEmaEstimator
+    finally:
+        rate_estimators._REGISTRY.pop("marker", None)
+
+
 def test_zone_controller_load_state():
     hass = MagicMock()
     coordinator, _ = create_mock_coordinator()

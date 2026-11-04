@@ -11,6 +11,7 @@ DOMAIN = "multizone_thermostat"
 
 # Config keys
 CONF_BOILER_MODE = "boiler_mode"
+CONF_RATE_ESTIMATOR = "rate_estimator"
 MODE_RELAY = "relay"
 MODE_OPENTHERM = "opentherm"
 CONF_BOILER_SWITCH = "boiler_switch"

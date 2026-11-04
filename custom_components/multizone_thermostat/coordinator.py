@@ -35,6 +35,7 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CONF_BOILER_SWITCH,
     CONF_BOILER_MODE,
+    CONF_RATE_ESTIMATOR,
     MODE_RELAY,
     MODE_OPENTHERM,
     CONF_OPENTHERM_ENTITY,
@@ -125,6 +126,7 @@ class MultizoneCoordinator:
         options = getattr(entry, "options", None) or {}
         config = {**(entry.data or {}), **(options if isinstance(options, dict) else {})}
         self.boiler_mode = config.get(CONF_BOILER_MODE, MODE_RELAY)
+        self.rate_estimator = config.get(CONF_RATE_ESTIMATOR)
         self.boiler_switch = config.get(CONF_BOILER_SWITCH)
         self.opentherm_entity = config.get(CONF_OPENTHERM_ENTITY)
         self.opentherm_min_temp = config.get(CONF_OPENTHERM_MIN_TEMP, 35.0)

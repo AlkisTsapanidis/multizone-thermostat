@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+### Refactor: Pluggable heating/cooling rate estimators
+- New `rate_estimators.py` defines the estimator contract (`update(ts, temp, is_heating)`, `heating_rate`, `cooling_rate`, optional `dump_state`/`load_state`), a registry (`register_estimator`) and the original algorithm as `LegacyEmaEstimator`, which remains the default so behaviour is unchanged.
+- `ThermalObserver` now delegates rate learning to the selected estimator (inertia tracking and the weather multiplier are unchanged) and accepts an optional sample timestamp so history can be replayed. Select one with the `rate_estimator` config option.
+- Persisted thermal state records which estimator produced the rates; rates saved by a different estimator are discarded on load and relearned. Existing stored data is treated as `legacy`.
+- Added a replay harness (`tests/thermal_harness`) with recorded sensor data to compare estimators; see `CoolingRateImprovements.md`.
+
 ## [6.0.1] - 2026-11-01
 ### Fix: UI Layout Polishing & Scheduler Navigation Robustness
 - **UI Overflow & Overlap Polishing**:

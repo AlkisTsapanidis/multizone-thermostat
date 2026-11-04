@@ -33,6 +33,11 @@ class ZoneController:
         self._thermal_models: dict[str, ThermalObserver] = {}
         self._last_seen_temps: dict[str, float] = {}
 
+        # Selected rate estimator (see rate_estimators.py); anything but a string means "default"
+        estimator_name = getattr(coordinator, "rate_estimator", None)
+        if not isinstance(estimator_name, str):
+            estimator_name = None
+
         for zone in self.zones:
             name = zone.get(CONF_ZONE_NAME)
             if not name:
@@ -43,7 +48,7 @@ class ZoneController:
                 kp=100.0, ki=0.0, kd=0.0, out_min=0.0, out_max=100.0, sensor_timeout=7200.0
             )
             self._autotuners[climate_id] = PassiveAutotuneObserver(climate_id, required_cycles=3)
-            self._thermal_models[climate_id] = ThermalObserver(climate_id)
+            self._thermal_models[climate_id] = ThermalObserver(climate_id, estimator=estimator_name)
 
         self._was_dhw_active: bool = False
 
