@@ -288,11 +288,11 @@ class ZoneSyncManager:
             demand = self._coordinator.get_zone_demand(self._entity_id)
             new_pwm_state = self._local_pwm.calculate(demand)
 
-        if new_pwm_state != self._local_pwm_state:
-            self._local_pwm_state = new_pwm_state
-            await self.async_sync_switches()
-            return True
-        return False
+        changed = new_pwm_state != self._local_pwm_state
+        self._local_pwm_state = new_pwm_state
+        # Level-triggered: always reconcile so skipped or lost commands are retried
+        await self.async_sync_switches()
+        return changed
 
     async def async_sync_switches(self) -> None:
         """Turn local switches ON or OFF based on PWM state."""
@@ -303,8 +303,10 @@ class ZoneSyncManager:
         
         for switch in self._switches:
             st = self.hass.states.get(switch)
-            if not st or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            if not st or st.state == STATE_UNAVAILABLE:
+                _LOGGER.warning("Zone %s: switch %s is unavailable, command skipped", self._zone_name, switch)
                 continue
+            # 'unknown' (e.g. MQTT with no retained state) must still be commanded
             if st.state != (STATE_ON if self._local_pwm_state else "off"):
                 await self.hass.services.async_call(
                     "switch",
@@ -328,7 +330,8 @@ class ZoneSyncManager:
 
         for valve_entity in self._valves:
             st = self.hass.states.get(valve_entity)
-            if not st or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            if not st or st.state == STATE_UNAVAILABLE:
+                _LOGGER.warning("Zone %s: valve %s is unavailable, command skipped", self._zone_name, valve_entity)
                 continue
             target_val = round(target_pct / 10.0, 1) if self._valve_scale == VALVE_SCALE_VOLT else round(target_pct, 1)
             last_val = self._last_valve_positions.get(valve_entity)

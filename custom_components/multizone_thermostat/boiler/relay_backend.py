@@ -16,7 +16,7 @@ from homeassistant.const import (
 
 from .base import BoilerBackend
 from ..pwm_engine import PWMEngine
-from ..const import CONF_ZONE_NAME, CONF_ZONE_CLIMATES, ZONE_MODE_PRIMARY, make_zone_entity_id
+from ..const import CONF_ZONE_NAME, CONF_ZONE_CLIMATES, CONF_ZONE_SWITCHES, ZONE_MODE_PRIMARY, make_zone_entity_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -97,13 +97,39 @@ class RelayBoilerBackend(BoilerBackend):
 
         self._pending_boiler_task = self.hass.async_create_task(_delayed_check())
 
+    def _switch_valve_path_open(self) -> bool | None:
+        """Check demanding switch-valve zones (no TRVs).
+
+        Returns None if there are none, True if any such valve switch is ON,
+        False if every one of them is closed.
+        """
+        found = False
+        for zone in self.coordinator.zones:
+            climate_id = make_zone_entity_id(zone[CONF_ZONE_NAME])
+            if self.coordinator.get_zone_mode(climate_id) != ZONE_MODE_PRIMARY:
+                continue
+            if not self.coordinator.get_zone_demand(climate_id) > 0:
+                continue
+            trvs = zone.get(CONF_ZONE_CLIMATES) or zone.get("climates") or zone.get("climate_entities") or []
+            switches = zone.get(CONF_ZONE_SWITCHES) or []
+            if trvs or not switches:
+                continue
+            found = True
+            for sw in switches:
+                st = self.hass.states.get(sw)
+                if st is not None and st.state == STATE_ON:
+                    return True
+        return False if found else None
+
     def _conditions_still_valid(self) -> bool:
-        """Re-check Master, DHW and demand before igniting after valve delay."""
+        """Re-check Master, DHW, demand and valve path before igniting after valve delay."""
         if self._last_frost_emergency:
             return True
         if not self.coordinator.get_master_state():
             return False
         if self.coordinator.is_dhw_active:
+            return False
+        if self._switch_valve_path_open() is False and not getattr(self, "_trv_path_ready", False):
             return False
         return self._last_demand > 0.0
 
@@ -113,10 +139,11 @@ class RelayBoilerBackend(BoilerBackend):
             return
 
         boiler_state = self.hass.states.get(self.boiler_switch)
-        if boiler_state is None or boiler_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            _LOGGER.debug("Boiler switch %s is not available yet, skipping command", self.boiler_switch)
+        if boiler_state is None or boiler_state.state == STATE_UNAVAILABLE:
+            _LOGGER.warning("Boiler switch %s is unavailable, skipping ON command", self.boiler_switch)
             return
 
+        was_off = boiler_state.state != STATE_ON
         was_off = boiler_state.state != STATE_ON
         has_pending_off = self._pending_command is not None and self._pending_command[0] == "off"
 
@@ -166,11 +193,13 @@ class RelayBoilerBackend(BoilerBackend):
             return
 
         boiler_state = self.hass.states.get(self.boiler_switch)
-        if boiler_state is None or boiler_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            _LOGGER.debug("Boiler switch %s is not available yet, skipping command", self.boiler_switch)
+        if boiler_state is None:
+            _LOGGER.warning("Boiler switch %s not found, cannot send OFF", self.boiler_switch)
             return
 
-        was_on = boiler_state.state == STATE_ON
+        # An OFF command is always attempted unless the switch is known to be off:
+        # after a restart the state is 'unknown' and the relay may really be on.
+        was_on = boiler_state.state != "off"
         has_pending_on = self._pending_command is not None and self._pending_command[0] == "on"
 
         if not was_on and not has_pending_on:
@@ -219,11 +248,11 @@ class RelayBoilerBackend(BoilerBackend):
         self._trv_wait_start = None
         self._status_reason = "OFF - Emergency/Master OFF"
         boiler_state = self.hass.states.get(self.boiler_switch) if self.boiler_switch else None
-        if boiler_state is None or boiler_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            _LOGGER.debug("Boiler switch %s is not available yet, skipping emergency off", self.boiler_switch)
+        if boiler_state is None:
+            _LOGGER.warning("Boiler switch %s not found, cannot send emergency OFF", self.boiler_switch)
             return
         has_pending_on = self._pending_command is not None and self._pending_command[0] == "on"
-        if boiler_state.state == STATE_ON or has_pending_on:
+        if boiler_state.state != "off" or has_pending_on:
             await self._force_boiler_off()
 
     async def async_update(self, demand: float, peak_zone: str | None, frost_emergency: bool) -> None:
@@ -281,9 +310,11 @@ class RelayBoilerBackend(BoilerBackend):
                 if mode == ZONE_MODE_PRIMARY and self.coordinator.get_zone_demand(climate_id) > 0:
                     trv_list = zone.get(CONF_ZONE_CLIMATES) or zone.get("climates") or zone.get("climate_entities") or []
                     if not trv_list:
-                        # Zone has no TRVs (e.g. relay only). Heat path is fully open by default.
-                        trvs_ready = True
-                        break
+                        # Switch-valve zones are judged by _switch_valve_path_open below.
+                        if not (zone.get(CONF_ZONE_SWITCHES) or []):
+                            trvs_ready = True
+                            break
+                        continue
                     
                     for trv in trv_list:
                         trv_state = self.hass.states.get(trv)
@@ -307,6 +338,15 @@ class RelayBoilerBackend(BoilerBackend):
                                 break
                 if trvs_ready:
                     break
+
+            self._trv_path_ready = trvs_ready
+            switch_path = self._switch_valve_path_open()
+            if switch_path is True:
+                trvs_ready = True
+            elif switch_path is False and not trvs_ready and not frost_emergency and peak_zone != "Anti-Seize":
+                self._status_reason = "HOLD_VALVES_CLOSED - Waiting for a zone valve to open"
+                _LOGGER.debug("PWM Tick: Boiler wants to turn ON, but all demanding zone valves are closed.")
+                return
 
             has_any_trvs = any(
                 (zone.get(CONF_ZONE_CLIMATES) or zone.get("climates") or zone.get("climate_entities") or [])

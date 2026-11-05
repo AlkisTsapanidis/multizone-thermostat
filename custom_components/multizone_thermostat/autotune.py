@@ -5,6 +5,8 @@ from datetime import datetime
 
 _LOGGER = logging.getLogger(__name__)
 
+MAX_KD_TO_KP = 60.0
+
 class PassiveAutotuneObserver:
     """
     Observes natural ON/OFF cycles (Hysteresis) to calculate PID parameters
@@ -146,7 +148,7 @@ class PassiveAutotuneObserver:
         td_calc = 0.5 * L
         
         ki_calc = kp_calc / ti_calc if ti_calc > 0 else 0
-        kd_calc = kp_calc * td_calc
+        kd_calc = min(kp_calc * td_calc, kp_calc * MAX_KD_TO_KP)
         
         _LOGGER.info("Autotune [%s]: Cycle valid! L=%.1f s, slope=%.6f °C/s. Kp=%.1f, Ki=%.4f, Kd=%.1f", 
                      self.zone_name, L, max_slope, kp_calc, ki_calc, kd_calc)
