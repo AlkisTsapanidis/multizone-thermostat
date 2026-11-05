@@ -24,6 +24,8 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_ON,
     STATE_OFF,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import (
@@ -72,6 +74,10 @@ from .const import (
     KEY_ANTI_SEIZE_DURATION,
     CONF_MIN_CYCLE_ON,
     CONF_MIN_CYCLE_OFF,
+    CONF_DERIVATIVE_WINDOW,
+    CONF_DERIVATIVE_LIMIT,
+    DEFAULT_DERIVATIVE_WINDOW,
+    DEFAULT_DERIVATIVE_LIMIT,
     CONF_VALVE_DELAY,
     DEFAULT_MIN_CYCLE_ON,
     DEFAULT_MIN_CYCLE_OFF,
@@ -145,6 +151,8 @@ class MultizoneCoordinator:
         self._master_switch: Any = None
         self._min_cycle_on = float(config.get(CONF_MIN_CYCLE_ON, DEFAULT_MIN_CYCLE_ON))
         self._min_cycle_off = float(config.get(CONF_MIN_CYCLE_OFF, DEFAULT_MIN_CYCLE_OFF))
+        self._derivative_window_min = float(config.get(CONF_DERIVATIVE_WINDOW, DEFAULT_DERIVATIVE_WINDOW))
+        self._derivative_limit_pct = float(config.get(CONF_DERIVATIVE_LIMIT, DEFAULT_DERIVATIVE_LIMIT))
         self._valve_delay = float(config.get(CONF_VALVE_DELAY, DEFAULT_VALVE_DELAY))
         self._climate_callbacks = {}
         self._last_active_time = time.monotonic()
@@ -465,6 +473,16 @@ class MultizoneCoordinator:
         if hasattr(self, "boiler_backend") and hasattr(self.boiler_backend, "set_min_cycle_off"):
             self.boiler_backend.set_min_cycle_off(int(value))
         
+    def set_derivative_window(self, minutes: float) -> None:
+        self._derivative_window_min = float(minutes)
+        for pid in self.zone_controller.pids.values():
+            pid.set_derivative_params(window=self._derivative_window_min * 60.0)
+
+    def set_derivative_limit(self, pct: float) -> None:
+        self._derivative_limit_pct = float(pct)
+        for pid in self.zone_controller.pids.values():
+            pid.set_derivative_params(limit=self._derivative_limit_pct)
+
     def set_valve_delay(self, value: float) -> None:
         self._valve_delay = value
         if hasattr(self, "boiler_backend") and hasattr(self.boiler_backend, "set_valve_delay"):
@@ -533,6 +551,13 @@ class MultizoneCoordinator:
 
         self.routine_manager.async_setup_listeners()
 
+        self._unsub_listeners.append(
+            async_track_time_interval(
+                self.hass,
+                self._async_periodic_zone_refresh,
+                timedelta(seconds=60),
+            )
+        )
         # Listen every minute for Schedule Profile evaluation
         if hasattr(self, "schedule_manager"):
             self._unsub_listeners.append(
@@ -588,7 +613,25 @@ class MultizoneCoordinator:
         new_state = event.data.get("new_state")
         if not new_state:
             return
-        demand = await self.zone_controller.async_update_zone(entity_id, new_state)
+        await self._async_refresh_zone(entity_id, new_state)
+
+    async def _async_periodic_zone_refresh(self, now) -> None:
+        """Recompute every zone's demand on a timer so a stale value can never latch."""
+        for zone in self.zones:
+            name = zone.get(CONF_ZONE_NAME)
+            if not name:
+                continue
+            climate_id = make_zone_entity_id(name)
+            state = self.hass.states.get(climate_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                continue
+            try:
+                await self._async_refresh_zone(climate_id, state, learn=False)
+            except Exception:
+                _LOGGER.exception("Periodic demand refresh failed for %s", climate_id)
+
+    async def _async_refresh_zone(self, entity_id, new_state, learn: bool = True) -> None:
+        demand = await self.zone_controller.async_update_zone(entity_id, new_state, learn=learn)
         self.demand_aggregator.set_zone_demand(entity_id, demand)
         # Immediately trigger boiler update to improve UI responsiveness when lowering target
         if hasattr(self, "plant_orchestrator"):

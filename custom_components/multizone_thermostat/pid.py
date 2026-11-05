@@ -16,10 +16,18 @@ _LOGGER = logging.getLogger(__name__)
 # Based on Arduino PID Library
 # See https://github.com/br3ttb/Arduino-PID-Library
 class PID:
+    # Defaults for the derivative term: slope is fitted over a 15 minute window and the
+    # resulting contribution is bounded to +/-15% of output.
+    DEFAULT_DERIVATIVE_WINDOW = 900.0
+    MAX_DERIVATIVE = 15.0
+    # A slope needs at least this many samples spanning this fraction of the window
+    MIN_DERIVATIVE_SAMPLES = 3
+    MIN_SPAN_FRACTION = 1.0 / 3.0
     error: float
 
     def __init__(self, kp, ki, kd, ke=0, out_min=float('-inf'), out_max=float('+inf'),
-                 sampling_period=0, cold_tolerance=0.3, hot_tolerance=0.3):
+                 sampling_period=0, cold_tolerance=0.3, hot_tolerance=0.3,
+                 derivative_window=DEFAULT_DERIVATIVE_WINDOW, derivative_limit=MAX_DERIVATIVE):
         """A proportional-integral-derivative controller.
             :param kp: Proportional coefficient.
             :type kp: float
@@ -77,7 +85,51 @@ class PID:
         self._sampling_period = sampling_period
         self._cold_tolerance = cold_tolerance
         self._hot_tolerance = hot_tolerance
+        self._derivative_window = 0.0
+        self._derivative_limit = 0.0
+        self._history: deque = deque()
+        self.set_derivative_params(window=derivative_window, limit=derivative_limit)
 
+    @property
+    def derivative_window(self):
+        """Seconds of history used for the derivative slope (0 disables D)."""
+        return self._derivative_window
+
+    @property
+    def derivative_limit(self):
+        """Maximum absolute derivative contribution in output units (0 disables D)."""
+        return self._derivative_limit
+
+    def set_derivative_params(self, window=None, limit=None):
+        """Configure the derivative window (seconds) and output limit; invalid values are ignored."""
+        if isinstance(window, (int, float)) and not isinstance(window, bool) and not math.isnan(window):
+            self._derivative_window = max(0.0, float(window))
+        if isinstance(limit, (int, float)) and not isinstance(limit, bool) and not math.isnan(limit):
+            self._derivative_limit = max(0.0, float(limit))
+
+    def _temperature_slope(self, now):
+        """Least-squares slope (input units per second) over the derivative window.
+
+        Returns None when there is not enough history to trust a slope.
+        """
+        window = self._derivative_window
+        if window <= 0.0 or now is None:
+            return None
+        history = self._history
+        history.append((now, self._input))
+        while history and history[0][0] < now - window:
+            history.popleft()
+        if len(history) < self.MIN_DERIVATIVE_SAMPLES:
+            return None
+        if history[-1][0] - history[0][0] < window * self.MIN_SPAN_FRACTION:
+            return None
+        n = len(history)
+        mean_t = sum(t for t, _ in history) / n
+        mean_v = sum(v for _, v in history) / n
+        den = sum((t - mean_t) ** 2 for t, _ in history)
+        if den <= 0.0:
+            return None
+        return sum((t - mean_t) * (v - mean_v) for t, v in history) / den
     @property
     def mode(self):
         return self._mode
@@ -154,7 +206,8 @@ class PID:
         self._input_time = None
         self._last_input = None
         self._last_input_time = None
-        
+        self._history.clear()
+
     def calc(self, input_val, set_point, input_time=None, last_input_time=None, ext_temp=None):
         """Adjusts and holds the given setpoint.
 
@@ -233,10 +286,13 @@ class PID:
             self._integral = max(min(self._integral, self._out_max - self._external), self._out_min - self._external)
 
         self._proportional = self._Kp * self._error
-        if self._dt >= 1.0:
-            self._derivative = -(self._Kd * self._input_diff) / self._dt
-        elif self._last_input is None:
+        slope = self._temperature_slope(self._input_time)
+        if slope is None or self._derivative_limit <= 0.0:
             self._derivative = 0.0
+        else:
+            derivative = -self._Kd * slope
+            # Bound D so quantised-sensor noise can never dominate the output
+            self._derivative = max(-self._derivative_limit, min(self._derivative_limit, derivative))
 
         # Compute PID Output
         output = self._proportional + self._integral + self._derivative + self._external

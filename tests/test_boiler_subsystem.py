@@ -166,19 +166,22 @@ async def test_relay_backend_skips_when_unavailable_fix_a():
     await backend.async_emergency_off()
     hass.services.async_call.assert_not_called()
 
-    # 2. State is "unavailable" (Z2M still starting)
+    # 2. State is "unavailable": ON is skipped, OFF is still attempted (fail-safe)
     hass.states.get = MagicMock(return_value=MagicMock(state="unavailable"))
     await backend._force_boiler_on()
-    await backend._force_boiler_off()
-    await backend.async_emergency_off()
     hass.services.async_call.assert_not_called()
+    await backend._force_boiler_off()
+    assert hass.services.async_call.call_args[0][1] == "turn_off"
+    hass.services.async_call.reset_mock()
 
-    # 3. State is "unknown"
+    # 3. State is "unknown" (no retained state after restart): commands must be sent
     hass.states.get = MagicMock(return_value=MagicMock(state="unknown"))
     await backend._force_boiler_on()
-    await backend._force_boiler_off()
+    assert hass.services.async_call.call_args[0][1] == "turn_on"
+    backend._pending_command = None
+    hass.services.async_call.reset_mock()
     await backend.async_emergency_off()
-    hass.services.async_call.assert_not_called()
+    assert hass.services.async_call.call_args[0][1] == "turn_off"
 
 
 @pytest.mark.asyncio

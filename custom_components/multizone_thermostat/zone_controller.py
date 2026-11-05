@@ -11,12 +11,21 @@ from .const import (
     HVAC_MODE_HEAT,
     ZONE_MODE_BYPASS,
     KEY_WEATHER_CURVE,
+    DEFAULT_DERIVATIVE_WINDOW,
+    DEFAULT_DERIVATIVE_LIMIT,
 )
 from .pid_wrapper import MultizonePID
 from .autotune import PassiveAutotuneObserver
 from .thermal_model import ThermalObserver
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _number_or(value, default):
+    """Return value if it is a real number, else default (guards unset/mocked config)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return default
 
 
 class ZoneController:
@@ -38,6 +47,9 @@ class ZoneController:
         if not isinstance(estimator_name, str):
             estimator_name = None
 
+        d_window_min = _number_or(getattr(coordinator, "_derivative_window_min", None), DEFAULT_DERIVATIVE_WINDOW)
+        d_limit_pct = _number_or(getattr(coordinator, "_derivative_limit_pct", None), DEFAULT_DERIVATIVE_LIMIT)
+
         for zone in self.zones:
             name = zone.get(CONF_ZONE_NAME)
             if not name:
@@ -45,7 +57,8 @@ class ZoneController:
             climate_id = make_zone_entity_id(name)
             # Default Kp=100, Ki=0, Kd=0 (will be overridden by Autolearning later)
             self._pids[climate_id] = MultizonePID(
-                kp=100.0, ki=0.0, kd=0.0, out_min=0.0, out_max=100.0, sensor_timeout=7200.0
+                kp=100.0, ki=0.0, kd=0.0, out_min=0.0, out_max=100.0, sensor_timeout=7200.0,
+                derivative_window=d_window_min * 60.0, derivative_limit=d_limit_pct,
             )
             self._autotuners[climate_id] = PassiveAutotuneObserver(climate_id, required_cycles=3)
             self._thermal_models[climate_id] = ThermalObserver(climate_id, estimator=estimator_name)
@@ -132,7 +145,7 @@ class ZoneController:
         except (ValueError, TypeError):
             return None
 
-    async def async_update_zone(self, entity_id: str, new_state: Any) -> float:
+    async def async_update_zone(self, entity_id: str, new_state: Any, learn: bool = True) -> float:
         """Calculate and update PID demand, autotuner and thermal model for a zone."""
         current_temp = new_state.attributes.get("current_temperature")
         target_temp = new_state.attributes.get("temperature")
@@ -263,6 +276,10 @@ class ZoneController:
         self.coordinator.demand_aggregator.set_zone_demand(entity_id, demand)
 
         tuner = self._autotuners[entity_id]
+        if not learn:
+            # Timer-driven refresh: demand only, learning observers stay event-driven
+            return demand
+
         if tuner.state != tuner.STATE_COMPLETED:
             tuner.update(current_temp, demand > 0)
             # Check if this update just completed the learning phase

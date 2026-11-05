@@ -24,7 +24,7 @@ class PlantOrchestrator:
                 
             await self._async_update_boiler()
         except Exception as err:
-            _LOGGER.error("Error in PlantOrchestrator.async_tick: %s", err)
+            _LOGGER.exception("Error in PlantOrchestrator.async_tick: %s", err)
 
     async def _async_update_boiler(self) -> None:
         """Handle the logic for pushing demand to boiler backend."""

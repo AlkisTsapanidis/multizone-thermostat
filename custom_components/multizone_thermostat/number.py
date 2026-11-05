@@ -14,6 +14,10 @@ from .const import (
     CONF_MIN_CYCLE_ON,
     CONF_MIN_CYCLE_OFF,
     CONF_VALVE_DELAY,
+    CONF_DERIVATIVE_WINDOW,
+    CONF_DERIVATIVE_LIMIT,
+    DEFAULT_DERIVATIVE_WINDOW,
+    DEFAULT_DERIVATIVE_LIMIT,
     DEFAULT_MIN_CYCLE_ON,
     DEFAULT_MIN_CYCLE_OFF,
     DEFAULT_VALVE_DELAY,
@@ -84,6 +88,32 @@ async def async_setup_entry(
             unit_of_measurement="s",
             icon="mdi:valve",
             default_val=DEFAULT_VALVE_DELAY,
+            device_info=device_info,
+        ),
+        MultizoneProtectionNumber(
+            coordinator=coordinator,
+            entry_id=config_entry.entry_id,
+            key=CONF_DERIVATIVE_WINDOW,
+            name="PID D Window",
+            min_value=0,
+            max_value=60,
+            step=1,
+            unit_of_measurement="min",
+            icon="mdi:chart-line",
+            default_val=DEFAULT_DERIVATIVE_WINDOW,
+            device_info=device_info,
+        ),
+        MultizoneProtectionNumber(
+            coordinator=coordinator,
+            entry_id=config_entry.entry_id,
+            key=CONF_DERIVATIVE_LIMIT,
+            name="PID D Limit",
+            min_value=0,
+            max_value=100,
+            step=1,
+            unit_of_measurement="%",
+            icon="mdi:chart-bell-curve",
+            default_val=DEFAULT_DERIVATIVE_LIMIT,
             device_info=device_info,
         ),
         MultizonePersistentNumber(
@@ -211,6 +241,10 @@ class MultizoneProtectionNumber(RestoreNumber):
             self._coordinator.set_min_cycle_off(value)
         elif self._key == CONF_VALVE_DELAY:
             self._coordinator.set_valve_delay(value)
+        elif self._key == CONF_DERIVATIVE_WINDOW:
+            self._coordinator.set_derivative_window(value)
+        elif self._key == CONF_DERIVATIVE_LIMIT:
+            self._coordinator.set_derivative_limit(value)
 
 
 class MultizonePersistentNumber(NumberEntity):

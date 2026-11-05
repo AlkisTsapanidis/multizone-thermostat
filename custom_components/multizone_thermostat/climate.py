@@ -166,6 +166,10 @@ class MultizoneVirtualThermostat(RestoreEntity, ClimateEntity):
             
         demand = self._coordinator.get_zone_demand(self.entity_id)
         if demand > 0:
+            if self._switches and not self._climates:
+                if any((s := self.hass.states.get(sw)) is not None and s.state == "on" for sw in self._switches):
+                    return HVACAction.HEATING
+                return HVACAction.IDLE
             return HVACAction.HEATING
         return HVACAction.IDLE
 

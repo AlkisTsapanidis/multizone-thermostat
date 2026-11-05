@@ -53,6 +53,8 @@ CONF_PRESENCE_SENSOR = "presence_sensor"
 # Protection keys
 CONF_MIN_CYCLE_ON = "min_cycle_on"
 CONF_MIN_CYCLE_OFF = "min_cycle_off"
+CONF_DERIVATIVE_WINDOW = "derivative_window_min"
+CONF_DERIVATIVE_LIMIT = "derivative_limit_pct"
 CONF_VALVE_DELAY = "valve_opening_delay"
 
 # Anti-seize configuration constants
@@ -114,6 +116,8 @@ KEY_ANTI_SEIZE_DURATION = "anti_seize_duration"
 DEFAULT_TRV_SYNC = False
 DEFAULT_MIN_CYCLE_ON = 5
 DEFAULT_MIN_CYCLE_OFF = 5
+DEFAULT_DERIVATIVE_WINDOW = 15  # minutes of history for the PID derivative slope (0 disables D)
+DEFAULT_DERIVATIVE_LIMIT = 15  # max PID derivative contribution, percent of output (0 disables D)
 DEFAULT_VALVE_DELAY = 0
 
 # Virtual Thermostat keys
