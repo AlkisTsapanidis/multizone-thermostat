@@ -103,6 +103,7 @@ from .const import (
 from .demand_aggregator import VALID_DEMAND_STRATEGIES
 from .rate_estimators import available_estimators
 from .pwm_engine import PWMEngine
+from . import telemetry
 from .thermal_model import ThermalObserver
 from .calendar_parser import parse_calendar_event, CalendarOverride
 
@@ -541,6 +542,7 @@ class MultizoneCoordinator:
             )
 
         # Start periodic PWM evaluation (every 10 seconds)
+        self._start_telemetry()
         self._unsub_listeners.append(
             async_track_time_interval(
                 self.hass,
@@ -589,6 +591,37 @@ class MultizoneCoordinator:
             # Check immediately on startup
             self.hass.async_create_task(self.calendar_manager.async_check_global_calendar(dt_util.now()))
 
+
+    def _start_telemetry(self) -> None:
+        """Install the process-wide JSONL telemetry recorder and flush it off the event loop."""
+        try:
+            directory = self.hass.config.path("mzt_telemetry")
+            if not isinstance(directory, str):
+                return
+            self._telemetry = telemetry.JsonlRecorder(directory)
+            telemetry.set_recorder(self._telemetry)
+            self._unsub_listeners.append(
+                async_track_time_interval(self.hass, self._async_flush_telemetry, timedelta(seconds=30))
+            )
+        except Exception as err:  # telemetry must never prevent the integration from starting
+            _LOGGER.warning("Telemetry disabled: %s", err)
+
+    async def _async_flush_telemetry(self, _now=None) -> None:
+        recorder = getattr(self, "_telemetry", None)
+        if recorder is not None:
+            await self.hass.async_add_executor_job(recorder.flush)
+
+    async def async_stop_telemetry(self) -> None:
+        """Flush remaining records and uninstall the recorder."""
+        recorder = getattr(self, "_telemetry", None)
+        if recorder is None:
+            return
+        try:
+            await self.hass.async_add_executor_job(recorder.flush)
+        finally:
+            if telemetry.get_recorder() is recorder:
+                telemetry.set_recorder(None)
+            self._telemetry = None
 
     def async_teardown_listeners(self) -> None:
         """Remove all state change listeners."""

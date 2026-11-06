@@ -12,6 +12,7 @@ from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, SERVICE_TURN_O
 from homeassistant.core import HomeAssistant, Context, State, Event
 
 from .pwm_engine import PWMEngine
+from . import telemetry
 from .const import KEY_PHYSICAL_SYNC_PREFIX, VALVE_SCALE_VOLT, DEFAULT_VALVE_SCALE
 
 _LOGGER = logging.getLogger(__name__)
@@ -284,12 +285,24 @@ class ZoneSyncManager:
 
         if master_hvac_mode == HVACMode.OFF:
             new_pwm_state = False
+            demand = None
+            pre = {}
         else:
             demand = self._coordinator.get_zone_demand(self._entity_id)
+            pre = {
+                "cycle_start_before": self._local_pwm.cycle_start_time,
+                "prev_demand_before": getattr(self._local_pwm, "_prev_demand", 0.0),
+            }
             new_pwm_state = self._local_pwm.calculate(demand)
 
         changed = new_pwm_state != self._local_pwm_state
         self._local_pwm_state = new_pwm_state
+        telemetry.get_recorder().record(
+            telemetry.KIND_PWM, self._zone_name, demand=demand, state=new_pwm_state, changed=changed,
+            master_off=master_hvac_mode == HVACMode.OFF, time_on=self._local_pwm.time_on,
+            time_off=self._local_pwm.time_off, pwm_interval=self._local_pwm.pwm_interval,
+            min_on=self._local_pwm.min_on, min_off=self._local_pwm.min_off, **pre,
+        )
         # Level-triggered: always reconcile so skipped or lost commands are retried
         await self.async_sync_switches()
         return changed
@@ -300,14 +313,19 @@ class ZoneSyncManager:
             return
 
         service = SERVICE_TURN_ON if self._local_pwm_state else SERVICE_TURN_OFF
+        recorder = telemetry.get_recorder()
         
         for switch in self._switches:
             st = self.hass.states.get(switch)
             if not st or st.state == STATE_UNAVAILABLE:
                 _LOGGER.warning("Zone %s: switch %s is unavailable, command skipped", self._zone_name, switch)
+                recorder.record(telemetry.KIND_SYNC, self._zone_name, switch=switch, desired=self._local_pwm_state,
+                                observed=getattr(st, "state", None), action="skipped_unavailable")
                 continue
             # 'unknown' (e.g. MQTT with no retained state) must still be commanded
             if st.state != (STATE_ON if self._local_pwm_state else "off"):
+                recorder.record(telemetry.KIND_SYNC, self._zone_name, switch=switch, desired=self._local_pwm_state,
+                                observed=st.state, action=service)
                 await self.hass.services.async_call(
                     "switch",
                     service,

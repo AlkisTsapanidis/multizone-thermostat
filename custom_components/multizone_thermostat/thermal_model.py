@@ -2,6 +2,7 @@
 import logging
 from datetime import datetime, timezone
 
+from . import telemetry
 from .rate_estimators import (
     DEFAULT_RATE_ESTIMATOR,
     LegacyEmaEstimator,
@@ -101,7 +102,11 @@ class ThermalObserver:
         if callable(set_outdoor):
             set_outdoor(outdoor_temp)
         self.estimator.update(timestamp, current_temp, is_heating)
-
+        telemetry.get_recorder().record(
+            telemetry.KIND_ESTIMATOR, self.zone_id, ts=now, temp=current_temp, is_heating=is_heating,
+            outdoor_temp=outdoor_temp, estimator=self.estimator_name,
+            heating_rate=self.estimator.heating_rate, cooling_rate=self.estimator.cooling_rate,
+        )
         if not self._seen_sample:
             self._seen_sample = True
             self._is_heating = is_heating

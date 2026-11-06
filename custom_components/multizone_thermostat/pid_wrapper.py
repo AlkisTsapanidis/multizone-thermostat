@@ -31,7 +31,7 @@ class MultizonePID:
         self.last_sensor_update = time.monotonic()
         self._last_input_time: float | None = None
         self._last_demand = 0.0
-        
+        self.last_calc: dict = {}
     @property
     def mode(self):
         return self._pid.mode
@@ -65,10 +65,24 @@ class MultizonePID:
         if self.sensor_timeout > 0 and (now - self.last_sensor_update) > self.sensor_timeout:
             _LOGGER.warning("PID: Dead Sensor Timeout reached (%.1f seconds). Forcing demand to 0%%.", (now - self.last_sensor_update))
             self._last_demand = 0.0
+            self.last_calc = {
+                "mono": now, "dead_sensor": True, "input": current_temp, "set_point": target_temp,
+                "demand": 0.0, "sensor_age": now - self.last_sensor_update,
+            }
             return self._last_demand
             
         # Calculate PID with tracked last_input_time to ensure proper dt calculation without jumps
-        demand, _ = self._pid.calc(current_temp, target_temp, input_time=now, last_input_time=self._last_input_time)
+        prev_input_time = self._last_input_time
+        demand, updated = self._pid.calc(current_temp, target_temp, input_time=now, last_input_time=self._last_input_time)
         self._last_input_time = now
         self._last_demand = demand
+        pid = self._pid
+        self.last_calc = {
+            "mono": now, "dead_sensor": False, "input": current_temp, "set_point": target_temp,
+            "last_input_time": prev_input_time, "updated": updated, "demand": demand,
+            "p": pid.proportional, "i": pid.integral, "d": pid.derivative, "ext": getattr(pid, "_external", 0.0),
+            "error": pid.error, "dt": pid.dt, "kp": pid._Kp, "ki": pid._Ki, "kd": pid._Kd,
+            "out_min": pid.out_min, "out_max": pid.out_max, "mode": pid.mode,
+            "sensor_age": now - self.last_sensor_update,
+        }
         return self._last_demand

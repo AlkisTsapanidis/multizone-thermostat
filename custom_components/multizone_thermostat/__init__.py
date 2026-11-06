@@ -352,6 +352,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await coordinator.boiler_backend.async_emergency_off()
         except Exception as err:
             _LOGGER.warning("Could not turn off boiler on unload: %s", err)
+        try:
+            await coordinator.async_stop_telemetry()
+        except Exception as err:
+            _LOGGER.warning("Could not flush telemetry on unload: %s", err)
         coordinator.async_teardown_listeners()
         hass.data[DOMAIN].pop(entry.entry_id)
         _LOGGER.info("Multizone Thermostat unloaded.")

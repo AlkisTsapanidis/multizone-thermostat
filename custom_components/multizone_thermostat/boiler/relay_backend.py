@@ -15,6 +15,7 @@ from homeassistant.const import (
 )
 
 from .base import BoilerBackend
+from .. import telemetry
 from ..pwm_engine import PWMEngine
 from ..const import CONF_ZONE_NAME, CONF_ZONE_CLIMATES, CONF_ZONE_SWITCHES, ZONE_MODE_PRIMARY, make_zone_entity_id
 
@@ -256,7 +257,29 @@ class RelayBoilerBackend(BoilerBackend):
             await self._force_boiler_off()
 
     async def async_update(self, demand: float, peak_zone: str | None, frost_emergency: bool) -> None:
-        """Feed Peak Load to PWM Engine and control the relay."""
+        """Feed Peak Load to PWM Engine and control the relay (recording telemetry around it)."""
+        pwm = self._boiler_pwm
+        pre = {
+            "cycle_start_before": pwm.cycle_start_time,
+            "prev_demand_before": getattr(pwm, "_prev_demand", 0.0),
+            "reason_before": self._status_reason,
+        }
+        try:
+            await self._async_update_impl(demand, peak_zone, frost_emergency)
+        finally:
+            boiler_state = self.hass.states.get(self.boiler_switch) if self.boiler_switch else None
+            telemetry.get_recorder().record(
+                telemetry.KIND_BOILER, "boiler",
+                demand=demand, peak_zone=peak_zone, frost_emergency=frost_emergency,
+                state=pwm.current_state, time_on=pwm.time_on, time_off=pwm.time_off,
+                pwm_interval=pwm.pwm_interval, min_on=pwm.min_on, min_off=pwm.min_off,
+                switch_state=getattr(boiler_state, "state", None),
+                pending_command=self._pending_command[0] if self._pending_command else None,
+                since_last_change=time.monotonic() - self._last_boiler_change,
+                reason=self._status_reason, **pre,
+            )
+
+    async def _async_update_impl(self, demand: float, peak_zone: str | None, frost_emergency: bool) -> None:
         self._last_demand = demand
         self._last_frost_emergency = frost_emergency
         wanted_state = self._boiler_pwm.calculate(demand)

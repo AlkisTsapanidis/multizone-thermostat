@@ -15,6 +15,7 @@ from .const import (
     DEFAULT_DERIVATIVE_LIMIT,
 )
 from .pid_wrapper import MultizonePID
+from . import telemetry
 from .autotune import PassiveAutotuneObserver
 from .thermal_model import ThermalObserver
 
@@ -230,9 +231,20 @@ class ZoneController:
                     demand = 0.0
                 else:
                     demand = current_demand  # Keep previous demand inside the hysteresis band
+                telemetry.get_recorder().record(
+                    telemetry.KIND_EVENT, entity_id, event="hysteresis_demand", input=current_temp,
+                    effective_target=effective_target, tolerance=tolerance, demand=demand,
+                    autotune_state=str(tuner.state),
+                )
             else:
                 # Smart PID Mode
                 demand = self._pids[entity_id].calc(current_temp, effective_target)
+                last_calc = getattr(self._pids[entity_id], "last_calc", None)
+                telemetry.get_recorder().record(
+                    telemetry.KIND_PID, entity_id, target_temp=target_temp, effective_target=effective_target,
+                    thermal_inertia=thermal_model.thermal_inertia,
+                    **(last_calc if isinstance(last_calc, dict) else {}),
+                )
 
                 # Apply Weather Compensation (Feed Forward)
                 try:
