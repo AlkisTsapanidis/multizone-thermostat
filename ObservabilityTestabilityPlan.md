@@ -1,8 +1,36 @@
 # Observability & Testability Plan: Before Any Control Code Changes
 
 **Date:** November 6, 2026  
-**Status:** Framework for improving visibility into control system behavior  
+**Status:** In progress; core telemetry, replay, and known-defect tests implemented, with important gaps remaining
+
 **Approach:** Comprehensive logging, test data infrastructure, and replay capability BEFORE touching any numerical code
+
+## Progress update
+
+The implementation differs from the illustrative classes and file names in this proposal.
+For the actual record format, commands, coverage and limitations, see
+[TelemetryAndReplay.md](./docs/TelemetryAndReplay.md).
+For deployment checks and real-world data collection, see
+[DeploymentTestPlan.md](./DeploymentTestPlan.md).
+
+- [x] Bounded JSONL telemetry with wall and monotonic timestamps, retention, and lossless
+  `NaN`/`+Inf`/`-Inf` handling. PID, valve PWM, relay boiler, switch sync and estimator
+  events are instrumented; this is **not** yet complete coverage of all control inputs and decisions.
+- [x] Offline CSV export and summary CLI; optional diagnostic sensor entities default to off.
+- [x] Synthetic scenarios and replay drivers for PWM, PID and estimators. PWM and PID
+  telemetry round trips are tested using generated records; PID replay requires a clean-state
+  boundary. A frozen PID reference supports differential tests.
+- [x] Known-defect tests for PID, PWM, estimators, switch sync and closed-loop valve/boiler
+  scenarios; strict expected failures can be run as ordinary failing tests with `--show-red`.
+- [x] The existing GitHub Actions workflow runs the test suite. This records the configured
+  CI step, not a claim that a particular remote run passed.
+- [ ] Complete instrumentation, replay and ground-truth coverage for every numerical and
+  control path, including real installation telemetry and full plant orchestration.
+- [ ] Validate on captured real-world logs and known datasets before changing numerical
+  control behavior or changing the default estimator. The legacy estimator remains the default.
+
+The phase descriptions and code snippets below are design proposals, not the current API.
+Week labels are historical sequencing suggestions, not deadlines.
 
 ---
 
@@ -708,37 +736,46 @@ def export_as_csv(zone_id: str, output_file: str):
 ## Phase 5: Implementation Roadmap
 
 ### Week 1: Logging Infrastructure
-- [ ] Create `ControlLogger` and `ControlEvent` classes
-- [ ] Instrument PID module (log every calc)
-- [ ] Instrument PWM engine (log every tick)
-- [ ] Add to Home Assistant coordinator
+- [x] Implement bounded control-event logging using `JsonlRecorder` and JSONL records
+- [x] Instrument PID calculations via the wrapper and zone controller
+- [x] Instrument valve and relay boiler PWM decisions at their callers
+- [x] Integrate the recorder lifecycle with the Home Assistant coordinator
 - [ ] Test on real system; capture 24+ hours of logs
 
-**Deliverable:** First real log file with control decisions
+**Partial:** OpenTherm, proportional valves, demand aggregation, frost/anti-seize, DHW,
+raw sensor events and configuration changes still need instrumentation.
+**Deliverable outstanding:** First verified real log file with control decisions.
 
 ### Week 2: Replay Engine & Export
-- [ ] Implement `ReplayEngine` class
+- [x] Implement component replay drivers and a manual clock in `tests/mzt_replay/`
 - [ ] Add Home Assistant service to export logs
-- [ ] Test replay on captured data
-- [ ] Verify outputs match logged values
+- [x] Add an offline CSV and summary CLI
+- [x] Verify PWM and PID outputs against generated production telemetry records
+- [ ] Test telemetry replay on captured real installation data and verify outputs
+- [ ] Support reliable replay of all relevant control paths and arbitrary time windows
 
-**Deliverable:** Ability to export and replay any 1-hour window
+**Partial:** PID replay starts at a clean-state boundary; an arbitrary one-hour window is not
+guaranteed to contain one. A Home Assistant export service is not implemented.
 
 ### Week 3: Test Suite (Red Tests)
-- [ ] Create synthetic scenario generators
-- [ ] Write failing tests for known bugs (sensor flicker, rate estimation, sync)
-- [ ] Document expected vs actual behavior
-- [ ] Set up CI to run tests
+- [x] Create seeded synthetic room and sensor scenarios
+- [x] Write known-defect tests for sensor flicker, rate estimation, PWM, sync and plant scenarios
+- [x] Document the covered defects and their expected versus observed behavior
+- [x] Configure CI to run the test suite
+- [ ] Extend coverage to the remaining serious failures and validate against known datasets
 
-**Deliverable:** Test suite with 5+ red tests, CI passes/fails clearly
+**Partial:** Known defects are strict expected failures by default and fail visibly with
+`--show-red`; the existing tests do not establish comprehensive coverage.
 
 ### Week 4: Dashboard & Analysis
 - [ ] Build web dashboard for control data visualization
-- [ ] Add CSV export for analysis
-- [ ] Document how to interpret logs
+- [x] Add CSV export for analysis
+- [x] Document record fields, export, replay and known defects
+- [ ] Develop complete guidance for interpreting real installation logs
 - [ ] Train on interpreting results
 
-**Deliverable:** Visual tool to inspect system behavior
+**Partial:** Optional diagnostic sensors expose the latest records in Home Assistant; a
+historical visualization dashboard is not implemented.
 
 ---
 
@@ -769,12 +806,10 @@ Once observability is in place, track:
 
 ## Next Steps
 
-1. Review this plan; adjust priorities as needed
-2. Start with Week 1 (logging infrastructure)
-3. Capture real-world data for 1-2 weeks
-4. Build replay engine (Week 2)
-5. Write red tests from captured data (Week 3)
-6. Once you can see and replay bugs reliably, you can fix them with confidence
+1. Complete missing instrumentation and extend replay and test coverage.
+2. Capture real-world telemetry and validate replay and defect tests against it and known datasets.
+3. Address the documented gaps in full plant orchestration, delayed valve behavior and analysis.
+4. Only then assess numerical fixes against the existing reference and red tests.
 
 **You won't touch any PID, PWM, or rate estimation code until you can replay the failure.**
 
