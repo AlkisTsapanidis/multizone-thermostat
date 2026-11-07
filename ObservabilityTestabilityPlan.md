@@ -37,7 +37,8 @@ For deployment checks and real-world data collection, see
   also replay through the real delayed task and relay command; consecutive non-overlapping
   cycles are checked for continuity. Sequential updates during a single pending delay can also
   share a backend and task, including a final update that cancels an already-waiting task;
-  otherwise, cancellation during a wait can be injected with its source marked unknown.
+  a final master-off action is also replayed, including task cancellation during its service call.
+  Otherwise, cancellation during a wait can be injected with its source marked unknown.
   Consecutive waiting cycles are independently replayed with backend and PWM continuity checks.
   Switch-path decisions are independently replayed. Full asynchronous recorded-plant replay remains outstanding.
 - [x] Captured schedule evaluation inputs and before/after overrides, and replayed individual
@@ -45,6 +46,18 @@ For deployment checks and real-world data collection, see
   from effective raw inputs and can be linked to evaluations by identifier. Sequential
   evaluation replay checks lifecycle and state continuity, including captured manual set/clear
   mutations; other override and configuration lifecycles remain open.
+- [x] Added OpenTherm update lifecycle boundaries and linked non-overlapping recorded updates
+  and emergency-off actions with pending-command and reason continuity checks. Calls are independently
+  replayed and linked to orchestrator decisions; overlapping actions remain outstanding.
+- [x] Added privacy-preserving calendar-processing boundaries and an offline continuity check
+  for non-overlapping completed operations. This is not calendar decision replay: parsed commands,
+  sensor/preset reads, external side effects and interrupted or overlapping operations remain gaps.
+- [x] Added sequenced monitored-input manifests and state observations, including selected HA
+  timestamps, old/new values and calibration entities; an offline history reconstructor checks
+  initialization, ordering and continuity. Added sequenced setting mutations/save outcomes and
+  preset, zone-mode and window-override checkpoints and mutations with reconstruction helpers.
+  Coordinator runtime master, cycle, valve-delay and derivative settings are also sequenced.
+  These cover selected inputs and settings, not all HA events or every direct storage write.
 - [x] The existing GitHub Actions workflow runs the test suite. This records the configured
   CI step, not a claim that a particular remote run passed.
 - [ ] Complete instrumentation, replay and ground-truth coverage for every numerical and

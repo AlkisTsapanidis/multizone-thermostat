@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, time as dt_time
 import logging
 import time
 from typing import Any
+from uuid import uuid4
 
 import homeassistant.util.dt as dt_util
 
@@ -47,6 +48,7 @@ from .const import (
     CONF_OPENTHERM_CH_SWITCH,
     CONF_ZONES,
     CONF_PRESENCE_SENSOR,
+    CONF_GEOFENCING_ENABLED,
     CONF_ANTI_SEIZE_ENABLED,
     CONF_ANTI_SEIZE_IDLE_DAYS,
     CONF_ANTI_SEIZE_DURATION,
@@ -57,6 +59,7 @@ from .const import (
     CONF_ZONE_TRV_SYNC,
     CONF_ZONE_ANTI_SEIZE,
     CONF_ZONE_CLIMATES,
+    CONF_ZONE_CALIBRATIONS,
     CONF_ZONE_SWITCHES,
     CONF_ZONE_VALVES,
     CONF_ZONE_TEMP_SENSOR,
@@ -134,6 +137,46 @@ SETTINGS_STORAGE_KEY = f"{DOMAIN}.settings"
 SETTINGS_STORAGE_VERSION = 1
 
 
+def _telemetry_input_snapshot(state) -> dict:
+    """Copy the selected control-relevant parts of an HA state."""
+    attrs = getattr(state, "attributes", None)
+    keys = (
+        "current_temperature", "temperature", "unit_of_measurement", "min", "max",
+        "position", "valve_position", "pi_heating_demand", "heating_demand", "valve_state",
+        "hvac_action", "preset_mode", "target_temp_step", "min_temp", "max_temp",
+    )
+    values = {}
+    if isinstance(attrs, Mapping):
+        values = {
+            key: attrs[key] for key in keys if key in attrs
+            and (attrs[key] is None or isinstance(attrs[key], (str, bool, int, float)))
+        }
+        for key in ("hvac_modes", "preset_modes"):
+            value = attrs.get(key)
+            if isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+                values[key] = list(value)
+    last_changed = getattr(state, "last_changed", None)
+    last_updated = getattr(state, "last_updated", None)
+    return {
+        "present": state is not None, "state": getattr(state, "state", None), "attributes": values,
+        "last_changed": last_changed if isinstance(last_changed, datetime) else None,
+        "last_updated": last_updated if isinstance(last_updated, datetime) else None,
+    }
+
+
+def _telemetry_setting_value(key, value) -> dict:
+    if value is None or isinstance(value, (bool, int, float)):
+        return {"value_recorded": True, "value": value}
+    if key in (KEY_RATE_ESTIMATOR, KEY_DEMAND_STRATEGY, KEY_NIGHT_TIME, KEY_MORNING_TIME,
+               KEY_PRE_AWAY_PRESET, KEY_PRE_NIGHT_PRESET) and isinstance(value, str):
+        return {"value_recorded": True, "value": value}
+    if key == "zone_modes" and isinstance(value, dict) and all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        return {"value_recorded": True, "value": value.copy()}
+    return {"value_recorded": False}
+
+
 def snapshot_control_config(config: Mapping) -> dict:
     """Copy allowlisted control configuration without unrelated entry data."""
     snapshot = {}
@@ -142,6 +185,8 @@ def snapshot_control_config(config: Mapping) -> dict:
         CONF_OPENTHERM_MIN_TEMP, CONF_OPENTHERM_MAX_TEMP, CONF_OPENTHERM_CH_SWITCH,
         CONF_WEATHER_SENSOR, CONF_MIN_CYCLE_ON, CONF_MIN_CYCLE_OFF, CONF_VALVE_DELAY,
         CONF_DERIVATIVE_WINDOW, CONF_DERIVATIVE_LIMIT, CONF_TELEMETRY_ENABLED, CONF_DEBUG_SENSORS,
+        CONF_PRESENCE_SENSOR, CONF_GLOBAL_CALENDAR, CONF_ANTI_SEIZE_ENABLED,
+        CONF_ANTI_SEIZE_IDLE_DAYS, CONF_ANTI_SEIZE_DURATION, CONF_ANTI_SEIZE_BOILER, CONF_GEOFENCING_ENABLED,
     )
     for key in scalar_keys:
         value = config.get(key)
@@ -166,6 +211,13 @@ def snapshot_control_config(config: Mapping) -> dict:
                     item[key] = value
                 elif isinstance(value, list) and all(isinstance(part, str) for part in value):
                     item[key] = value.copy()
+            calibrations = zone.get(CONF_ZONE_CALIBRATIONS)
+            if isinstance(calibrations, Mapping) and all(
+                isinstance(k, str) and isinstance(v, str) for k, v in calibrations.items()
+            ):
+                item[CONF_ZONE_CALIBRATIONS] = dict(calibrations)
+            if isinstance(zone.get("climate_id"), str):
+                item["climate_id"] = zone["climate_id"]
             zones.append(item)
         snapshot[CONF_ZONES] = zones
     return snapshot
@@ -182,8 +234,15 @@ class MultizoneCoordinator:
         """Initialize the coordinator."""
         self.hass = hass
         self.entry_id = entry.entry_id
+        self._telemetry_input_epoch = uuid4().hex
+        self._telemetry_input_step = 0
+        self._telemetry_settings_epoch = uuid4().hex
+        self._telemetry_settings_step = 0
+        self._telemetry_runtime_epoch = uuid4().hex
+        self._telemetry_runtime_step = 0
         options = getattr(entry, "options", None) or {}
         config = {**(entry.data or {}), **(options if isinstance(options, dict) else {})}
+        self._telemetry_control_config = snapshot_control_config(config)
         self.boiler_mode = config.get(CONF_BOILER_MODE, MODE_RELAY)
         self.rate_estimator = config.get(CONF_RATE_ESTIMATOR)
         self.boiler_switch = config.get(CONF_BOILER_SWITCH)
@@ -394,10 +453,49 @@ class MultizoneCoordinator:
         """Get a persistent setting."""
         return self._settings.get(key, default)
         
+    def _record_setting_mutation(self, source: str, key: str, previous_present: bool,
+                                 previous: Any, value: Any):
+        epoch = getattr(self, "_telemetry_settings_epoch", None)
+        if not isinstance(epoch, str):
+            epoch = self._telemetry_settings_epoch = uuid4().hex
+            self._telemetry_settings_step = 0
+        step = self._telemetry_settings_step
+        self._telemetry_settings_step += 1
+        recorder = telemetry.get_recorder()
+        recorder.record(
+            telemetry.KIND_CONFIG, None, source=source,
+            epoch=epoch, step=step, key=key, previous_present=previous_present,
+            previous=_telemetry_setting_value(key, previous), current=_telemetry_setting_value(key, value),
+        )
+        return recorder, epoch, step
+
+    def _record_direct_persistent_setting(self, key: str, previous_present: bool,
+                                          previous: Any, value: Any) -> None:
+        self._record_setting_mutation("persistent_setting_direct", key, previous_present, previous, value)
+
     async def async_set_persistent_data(self, key: str, value: Any) -> None:
         """Set a persistent setting."""
+        previous = self._settings.get(key)
+        present = key in self._settings
         self._settings[key] = value
-        await self._settings_store.async_save(self._settings)
+        recorder, epoch, step = MultizoneCoordinator._record_setting_mutation(
+            self, "persistent_setting_mutation", key, present, previous, value,
+        )
+        completed, cancelled, error = False, False, None
+        try:
+            await self._settings_store.async_save(self._settings)
+            completed = True
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as err:
+            error = type(err).__name__
+            raise
+        finally:
+            recorder.record(
+                telemetry.KIND_CONFIG, None, source="persistent_setting_save",
+                epoch=epoch, step=step, completed=completed, cancelled=cancelled, error=error,
+            )
         if isinstance(value, (int, float, bool)) or value is None:
             telemetry.get_recorder().record(telemetry.KIND_CONFIG, None, source="persistent_setting", key=key, value=value)
         elif isinstance(value, str) and key in (KEY_RATE_ESTIMATOR, "demand_strategy"):
@@ -521,29 +619,50 @@ class MultizoneCoordinator:
         """Register a select entity."""
         self._select_entities[key] = select_entity
 
+    def _record_runtime_control_setting(self, key: str, previous: Any, value: Any) -> None:
+        epoch = getattr(self, "_telemetry_runtime_epoch", None)
+        if not isinstance(epoch, str):
+            epoch = self._telemetry_runtime_epoch = uuid4().hex
+            self._telemetry_runtime_step = 0
+        step = self._telemetry_runtime_step
+        self._telemetry_runtime_step += 1
+        telemetry.get_recorder().record(
+            telemetry.KIND_CONFIG, None, source="runtime_control_setting",
+            epoch=epoch, step=step, key=key, previous=previous, value=value,
+        )
 
     def set_min_cycle_on(self, value: float) -> None:
+        previous = getattr(self, "_min_cycle_on", None)
         self._min_cycle_on = value
+        self._record_runtime_control_setting("min_cycle_on", previous, self._min_cycle_on)
         if hasattr(self, "boiler_backend") and hasattr(self.boiler_backend, "set_min_cycle_on"):
             self.boiler_backend.set_min_cycle_on(int(value))
         
     def set_min_cycle_off(self, value: float) -> None:
+        previous = getattr(self, "_min_cycle_off", None)
         self._min_cycle_off = value
+        self._record_runtime_control_setting("min_cycle_off", previous, self._min_cycle_off)
         if hasattr(self, "boiler_backend") and hasattr(self.boiler_backend, "set_min_cycle_off"):
             self.boiler_backend.set_min_cycle_off(int(value))
         
     def set_derivative_window(self, minutes: float) -> None:
+        previous = getattr(self, "_derivative_window_min", None)
         self._derivative_window_min = float(minutes)
+        self._record_runtime_control_setting("derivative_window_min", previous, self._derivative_window_min)
         for pid in self.zone_controller.pids.values():
             pid.set_derivative_params(window=self._derivative_window_min * 60.0)
 
     def set_derivative_limit(self, pct: float) -> None:
+        previous = getattr(self, "_derivative_limit_pct", None)
         self._derivative_limit_pct = float(pct)
+        self._record_runtime_control_setting("derivative_limit_pct", previous, self._derivative_limit_pct)
         for pid in self.zone_controller.pids.values():
             pid.set_derivative_params(limit=self._derivative_limit_pct)
 
     def set_valve_delay(self, value: float) -> None:
+        previous = getattr(self, "_valve_delay", None)
         self._valve_delay = value
+        self._record_runtime_control_setting("valve_opening_delay", previous, self._valve_delay)
         if hasattr(self, "boiler_backend") and hasattr(self.boiler_backend, "set_valve_delay"):
             self.boiler_backend.set_valve_delay(int(value))
 
@@ -555,11 +674,15 @@ class MultizoneCoordinator:
     @master_enabled.setter
     def master_enabled(self, state: bool) -> None:
         """Set master switch state."""
+        previous = getattr(self, "_master_state", None)
         self._master_state = bool(state)
+        self._record_runtime_control_setting("master_enabled", previous, self._master_state)
 
     def set_master_state(self, state: bool) -> None:
         """Set master state (called by master switch entity)."""
+        previous = getattr(self, "_master_state", None)
         self._master_state = state
+        self._record_runtime_control_setting("master_enabled", previous, self._master_state)
 
     def get_master_state(self) -> bool:
         """Get current master state."""
@@ -676,8 +799,31 @@ class MultizoneCoordinator:
                 (key in (KEY_RATE_ESTIMATOR, KEY_DEMAND_STRATEGY) and isinstance(value, str))
             }
             zones = snapshot_control_config({CONF_ZONES: getattr(self, "zones", [])}).get(CONF_ZONES, [])
+            string_settings = (KEY_RATE_ESTIMATOR, KEY_DEMAND_STRATEGY, KEY_NIGHT_TIME,
+                               KEY_MORNING_TIME, KEY_PRE_AWAY_PRESET, KEY_PRE_NIGHT_PRESET)
+            control_settings.update({
+                key: value for key, value in settings.items()
+                if key in string_settings and isinstance(value, str)
+            })
+            zone_modes = settings.get("zone_modes")
+            if isinstance(zone_modes, dict) and all(
+                isinstance(key, str) and isinstance(value, str) for key, value in zone_modes.items()
+            ):
+                control_settings["zone_modes"] = zone_modes.copy()
             self._telemetry.record(
                 telemetry.KIND_CONFIG, None, source="startup", settings=control_settings,
+                settings_epoch=self._telemetry_settings_epoch,
+                settings_next_step=self._telemetry_settings_step,
+                entry_config=self._telemetry_control_config,
+                runtime_epoch=self._telemetry_runtime_epoch,
+                runtime_next_step=self._telemetry_runtime_step,
+                runtime_settings={
+                    "min_cycle_on": self._min_cycle_on, "min_cycle_off": self._min_cycle_off,
+                    "valve_opening_delay": self._valve_delay,
+                    "derivative_window_min": self._derivative_window_min,
+                    "derivative_limit_pct": self._derivative_limit_pct,
+                    "master_enabled": self._master_state,
+                },
                 zones=zones,
                 boiler_mode=getattr(self, "boiler_mode", None),
                 boiler_switch=getattr(self, "boiler_switch", None),
@@ -693,6 +839,7 @@ class MultizoneCoordinator:
                 derivative_limit=getattr(self, "_derivative_limit_pct", None),
                 rate_estimator=getattr(self, "rate_estimator", None),
             )
+            self.zone_manager.record_preset_checkpoint()
             schedule = getattr(self, "schedule_manager", None)
             if schedule is not None:
                 schedule.record_schedule_state("schedule_startup")
@@ -712,6 +859,9 @@ class MultizoneCoordinator:
             if not isinstance(zone, dict):
                 continue
             name = zone.get(CONF_ZONE_NAME)
+            climate_id = zone.get("climate_id")
+            if isinstance(climate_id, str) and climate_id:
+                entities.add(climate_id)
             if name:
                 entities.add(make_zone_entity_id(name))
             for key in (CONF_ZONE_TEMP_SENSOR, CONF_ZONE_WINDOW_SENSOR):
@@ -722,39 +872,46 @@ class MultizoneCoordinator:
                 values = zone.get(key)
                 if isinstance(values, list):
                     entities.update(value for value in values if isinstance(value, str) and value)
+            calibrations = zone.get(CONF_ZONE_CALIBRATIONS)
+            if isinstance(calibrations, Mapping):
+                entities.update(value for value in calibrations.values() if isinstance(value, str) and value)
         if not entities:
             return
         try:
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, None, event="configured_inputs_start",
+                epoch=self._telemetry_input_epoch, entities=sorted(entities),
+            )
             self._unsub_listeners.append(async_track_state_change_event(
                 self.hass, sorted(entities), self._record_telemetry_input_event,
             ))
             for entity in sorted(entities):
                 self._record_telemetry_input(entity, self.hass.states.get(entity), "initial")
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, None, event="configured_inputs_ready",
+                epoch=self._telemetry_input_epoch, next_step=self._telemetry_input_step,
+            )
         except Exception:
             _LOGGER.exception("Unable to observe configured telemetry inputs")
 
     def _record_telemetry_input_event(self, event) -> None:
         try:
-            self._record_telemetry_input(event.data.get("entity_id"), event.data.get("new_state"), "change")
+            self._record_telemetry_input(
+                event.data.get("entity_id"), event.data.get("new_state"), "change",
+                old_state=event.data.get("old_state"), event_time=getattr(event, "time_fired", None),
+            )
         except Exception:
             _LOGGER.exception("Unable to record configured input change")
 
-    def _record_telemetry_input(self, entity_id, state, source) -> None:
-        attrs = getattr(state, "attributes", None)
-        keys = (
-            "current_temperature", "temperature", "unit_of_measurement", "min", "max",
-            "position", "valve_position", "pi_heating_demand", "heating_demand", "valve_state",
-            "hvac_action", "preset_mode",
-        )
-        values = {}
-        if isinstance(attrs, Mapping):
-            values = {
-                key: attrs[key] for key in keys if key in attrs
-                and (attrs[key] is None or isinstance(attrs[key], (str, bool, int, float)))
-            }
+    def _record_telemetry_input(self, entity_id, state, source, *, old_state=None, event_time=None) -> None:
+        step = self._telemetry_input_step
+        self._telemetry_input_step += 1
         telemetry.get_recorder().record(
             telemetry.KIND_SENSOR, entity_id, source="configured_input", observation=source,
-            state=getattr(state, "state", None), attributes=values,
+            epoch=self._telemetry_input_epoch, step=step,
+            **_telemetry_input_snapshot(state),
+            old=_telemetry_input_snapshot(old_state) if source == "change" else None,
+            event_time=event_time if isinstance(event_time, datetime) else None,
         )
 
     async def _async_flush_telemetry(self, _now=None) -> None:

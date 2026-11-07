@@ -1,5 +1,6 @@
 import logging
 from typing import Any
+from uuid import uuid4
 
 from homeassistant.core import HomeAssistant, Event, callback
 from homeassistant.components.climate.const import HVACMode
@@ -45,6 +46,45 @@ class ZoneManager:
         self._pre_window_state: dict[str, str] = {}
         self._presets: dict[str, dict[str, dict[str, Any]]] = {}
         self._current_global_preset: str = GLOBAL_PRESET_MANUAL
+        self._telemetry_epoch = uuid4().hex
+        self._telemetry_step = 0
+
+    def _record_preset_change(self, action: str, **fields) -> None:
+        step = self._telemetry_step
+        self._telemetry_step += 1
+        telemetry.get_recorder().record(
+            telemetry.KIND_CONFIG, None, source="preset_change",
+            epoch=self._telemetry_epoch, step=step, action=action, **fields,
+        )
+
+    def record_preset_checkpoint(self) -> None:
+        """Record the control-relevant parts of restored preset state."""
+        presets = {}
+        complete = True
+        for preset, zones in self._presets.items():
+            if not isinstance(preset, str) or not isinstance(zones, dict):
+                complete = False
+                continue
+            presets[preset] = {}
+            for zone, values in zones.items():
+                if not isinstance(zone, str) or not isinstance(values, dict):
+                    complete = False
+                    continue
+                item = {}
+                for key in ("target_temp", "mode", "bypassed"):
+                    if key in values:
+                        value = values[key]
+                        if value is None or isinstance(value, (str, bool, int, float)):
+                            item[key] = value
+                        else:
+                            complete = False
+                presets[preset][zone] = item
+        telemetry.get_recorder().record(
+            telemetry.KIND_CONFIG, None, source="preset_checkpoint", epoch=self._telemetry_epoch,
+            next_step=self._telemetry_step, complete=complete, presets=presets,
+            current_preset=self._current_global_preset,
+            zone_modes=self._zone_modes.copy(), pre_window_state=self._pre_window_state.copy(),
+        )
 
     def load_state(self, pre_window_state: dict, presets: dict, zone_modes: dict) -> None:
         """Load restored state from storage."""
@@ -100,6 +140,7 @@ class ZoneManager:
         """Set zone mode and persist/update dependencies."""
         previous_mode = self._zone_modes.get(climate_entity)
         self._zone_modes[climate_entity] = mode
+        self._record_preset_change("zone_mode", climate_id=climate_entity, value=mode)
         telemetry.get_recorder().record(
             telemetry.KIND_EVENT, climate_entity, event="zone_mode_changed",
             previous_mode=previous_mode, mode=mode, save_to_preset=save_to_preset,
@@ -111,7 +152,12 @@ class ZoneManager:
         zone_modes = dict(existing_modes) if isinstance(existing_modes, dict) else {}
         zone_modes[climate_entity] = mode
         if hasattr(self.coordinator, "_settings") and isinstance(self.coordinator._settings, dict):
+            previous_present = "zone_modes" in self.coordinator._settings
+            previous = self.coordinator._settings.get("zone_modes")
             self.coordinator._settings["zone_modes"] = zone_modes
+            record_direct = getattr(self.coordinator, "_record_direct_persistent_setting", None)
+            if callable(record_direct):
+                record_direct("zone_modes", previous_present, previous, zone_modes)
         self.hass.async_create_task(self.coordinator.async_set_persistent_data("zone_modes", zone_modes))
 
         # Notify climate entity callback so extra_state_attributes update immediately
@@ -126,6 +172,9 @@ class ZoneManager:
                 self._presets[self._current_global_preset][climate_entity] = {}
 
             self._presets[self._current_global_preset][climate_entity]["mode"] = mode
+            self._record_preset_change(
+                "mode", preset=self._current_global_preset, climate_id=climate_entity, value=mode,
+            )
             self.hass.async_create_task(self.coordinator._async_save_presets_storage())
 
     @property
@@ -136,6 +185,7 @@ class ZoneManager:
     def set_global_preset(self, preset: str) -> None:
         """Set the global preset (used on restore)."""
         self._current_global_preset = preset
+        self._record_preset_change("current", value=preset)
 
     def get_global_preset(self) -> str:
         """Get the current global preset."""
@@ -144,6 +194,7 @@ class ZoneManager:
     async def async_set_global_preset(self, preset: str) -> None:
         """Set the global preset and apply it to all zones."""
         self._current_global_preset = preset
+        self._record_preset_change("current", value=preset)
         _LOGGER.debug("Global preset changed to: %s", preset)
         
         # Notify the UI select entity if it's registered
@@ -262,6 +313,7 @@ class ZoneManager:
                 if climate_id not in self._pre_window_state:
                     current_mode = self._zone_modes.get(climate_id, ZONE_MODE_PRIMARY)
                     self._pre_window_state[climate_id] = current_mode
+                    self._record_preset_change("window_store", climate_id=climate_id, value=current_mode)
                     self.hass.async_create_task(self.coordinator.async_save_storage())
                 
                 if self._zone_modes.get(climate_id) != ZONE_MODE_BYPASS:
@@ -276,6 +328,7 @@ class ZoneManager:
                 _LOGGER.debug("Window closed or sensor lost (%s), restoring zone %s", sensor_id, climate_id)
                 if climate_id in self._pre_window_state:
                     was_mode = self._pre_window_state.pop(climate_id)
+                    self._record_preset_change("window_clear", climate_id=climate_id, value=was_mode)
                     self.hass.async_create_task(self.coordinator.async_save_storage())
                     
                     if self._zone_modes.get(climate_id) != was_mode:
@@ -293,6 +346,7 @@ class ZoneManager:
             self._presets[preset][zone_id] = {}
             
         self._presets[preset][zone_id]["target_temp"] = temp
+        self._record_preset_change("target_temp", preset=preset, climate_id=zone_id, value=temp)
         self.hass.async_create_task(self.coordinator._async_save_presets_storage())
 
     def get_preset_temperature(self, preset: str, climate_id: str) -> float | None:

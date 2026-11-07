@@ -1,7 +1,14 @@
 """Calendar and Smart Start manager for Multizone Thermostat."""
 
+import asyncio
+import copy
+import hashlib
+import hmac
 import logging
+import secrets
 from datetime import datetime, timedelta
+from uuid import uuid4
+
 import homeassistant.util.dt as dt_util
 
 from .calendar_parser import parse_calendar_event
@@ -23,6 +30,30 @@ class CalendarManager:
         self.smart_start_overrides: dict[str, float] = {}
         self.mode_overrides: dict[str, str] = {}
         self.pre_calendar_preset: str | None = None
+        self._replay_epoch = uuid4().hex
+        self._replay_step = 0
+        self._replay_identity_key = secrets.token_bytes(32)
+
+    def _record_replay_boundary(self, recorder, phase, step, now, **outcome) -> None:
+        if not recorder.enabled:
+            return
+        try:
+            identity = None
+            if self.active_event_id is not None:
+                identity = hmac.new(
+                    self._replay_identity_key, self.active_event_id.encode("utf-8"), hashlib.sha256,
+                ).hexdigest()
+            state = copy.deepcopy({
+                "active_event_token": identity, "pre_calendar_preset": self.pre_calendar_preset,
+                "current": self.current_event_overrides, "smart_start": self.smart_start_overrides,
+                "modes": self.mode_overrides,
+            })
+            recorder.record(
+                telemetry.KIND_EVENT, "boiler", event="calendar_processing_" + phase,
+                epoch=self._replay_epoch, step=step, evaluated_at=now, state=state, **outcome,
+            )
+        except Exception:
+            _LOGGER.exception("Unable to capture calendar processing telemetry")
 
     @property
     def hass(self):
@@ -132,6 +163,33 @@ class CalendarManager:
         now: datetime,
     ) -> None:
         """Process current and future events."""
+        step = self._replay_step
+        self._replay_step += 1
+        recorder = telemetry.get_recorder()
+        self._record_replay_boundary(recorder, "start", step, now)
+        completed, cancelled, error = False, False, None
+        try:
+            await self._async_process_calendar_events_impl(current_events, next_event, now, step)
+            completed = True
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as err:
+            error = type(err).__name__
+            raise
+        finally:
+            self._record_replay_boundary(
+                recorder, "end", step, now, completed=completed, cancelled=cancelled, error=error,
+            )
+
+    async def _async_process_calendar_events_impl(
+        self,
+        current_events: list[dict],
+        next_event: dict | list[dict] | None,
+        now: datetime,
+        step: int,
+    ) -> None:
+        """Apply current and future calendar events."""
         # 1. Process Current Events
         if current_events:
             # We use a combined ID to track changes in overlapping events
@@ -295,6 +353,7 @@ class CalendarManager:
             self._notify_climates_and_sync_trvs(changed_zones)
         telemetry.get_recorder().record(
             telemetry.KIND_EVENT, "boiler", event="calendar_overrides",
+            epoch=self._replay_epoch, step=step,
             evaluated_at=now, active_event=self.active_event_id is not None,
             pre_calendar_preset=self.pre_calendar_preset,
             current=self.current_event_overrides.copy(), smart_start=self.smart_start_overrides.copy(),

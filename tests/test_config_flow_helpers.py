@@ -1,40 +1,6 @@
 import pytest
-import importlib.abc
-import importlib.machinery
 import sys
 from unittest.mock import MagicMock
-
-class HomeAssistantMockLoader(importlib.abc.Loader):
-    def __init__(self, mock_module):
-        self.mock_module = mock_module
-    def create_module(self, spec):
-        return self.mock_module
-    def exec_module(self, module):
-        pass
-
-class HomeAssistantMockFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname == 'homeassistant' or fullname.startswith('homeassistant.'):
-            mock_module = MagicMock()
-            mock_module.__path__ = []
-            if fullname == 'homeassistant.components.climate':
-                mock_module.DOMAIN = 'climate'
-            if fullname == 'homeassistant.components.switch':
-                mock_module.DOMAIN = 'switch'
-            if fullname == 'homeassistant.components.sensor':
-                mock_module.DOMAIN = 'sensor'
-            if fullname == 'homeassistant.components.binary_sensor':
-                mock_module.DOMAIN = 'binary_sensor'
-            if fullname == 'homeassistant.core':
-                mock_module.HomeAssistant = MagicMock
-                mock_module.callback = lambda f: f
-            if fullname == 'homeassistant.helpers.entity_registry':
-                del mock_module.async_entries_for_domain
-            return importlib.machinery.ModuleSpec(fullname, HomeAssistantMockLoader(mock_module))
-        return None
-
-if not any(isinstance(finder, HomeAssistantMockFinder) for finder in sys.meta_path):
-    sys.meta_path.insert(0, HomeAssistantMockFinder())
 
 import unittest
 import sys
@@ -181,4 +147,3 @@ class TestConfigFlowHelpers(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

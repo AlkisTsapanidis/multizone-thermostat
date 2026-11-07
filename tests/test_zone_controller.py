@@ -2,42 +2,8 @@
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import importlib.abc
-import importlib.machinery
 from unittest.mock import MagicMock, AsyncMock, patch
 import asyncio
-
-class HomeAssistantMockLoader(importlib.abc.Loader):
-    def __init__(self, mock_module):
-        self.mock_module = mock_module
-    def create_module(self, spec):
-        return self.mock_module
-    def exec_module(self, module):
-        pass
-
-class HomeAssistantMockFinder(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname == 'homeassistant' or fullname.startswith('homeassistant.'):
-            mock_module = MagicMock()
-            mock_module.__path__ = []
-            if fullname == 'homeassistant.components.climate.const':
-                mock_module.HVACMode = MagicMock()
-                mock_module.HVACMode.HEAT = 'heat'
-                mock_module.HVACMode.OFF = 'off'
-            if fullname == 'homeassistant.core':
-                mock_module.callback = lambda f: f
-                mock_module.HomeAssistant = MagicMock
-            if fullname == 'homeassistant.const':
-                mock_module.ATTR_ENTITY_ID = 'entity_id'
-                mock_module.ATTR_TEMPERATURE = 'temperature'
-            if fullname == 'homeassistant.util':
-                from tests.dummy_ha.homeassistant.util import slugify as dummy_slugify
-                mock_module.slugify = dummy_slugify
-            return importlib.machinery.ModuleSpec(fullname, HomeAssistantMockLoader(mock_module))
-        return None
-
-if not any(isinstance(finder, HomeAssistantMockFinder) for finder in sys.meta_path):
-    sys.meta_path.insert(0, HomeAssistantMockFinder())
 
 from custom_components.multizone_thermostat.zone_controller import ZoneController
 from custom_components.multizone_thermostat.const import (

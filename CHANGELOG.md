@@ -42,11 +42,19 @@
   zone mode resolution, calendar override snapshots, DHW freezes, weather compensation, frost
   checks, anti-seize lifecycles and zone-control skip reasons.
 - Records relay emergency-off and delayed-task lifecycles, OpenTherm diagnostic inputs and
-  inferred state, and effective schedule-evaluation inputs, manual override mutations and
-  smart-start observations. Calendar and schedule snapshots can reveal household routines;
-  unrelated complex configuration values are not logged.
+  inferred state and update lifecycle boundaries, and effective schedule-evaluation inputs,
+  manual override mutations and smart-start observations. Calendar processing now has start/end
+  boundaries with per-instance keyed event-identity tokens, state snapshots and completion status;
+  titles and raw event IDs are not included in these telemetry records. Calendar and schedule
+  snapshots can reveal household routines; unrelated complex configuration values are not logged.
 - Input, configuration and override logging remains selective; it is not a complete history.
   Independent physical flow and actuator feedback are not included.
+- Configured input observations now include a tracked-entity manifest, contiguous steps, old/new
+  selected state and HA timestamps; calibration entities and relevant HVAC capability attributes
+  are included. Persistent setting mutations and save outcomes, plus preset, zone-mode and
+  window-override checkpoints and changes, are recorded for history reconstruction. Runtime
+  master, cycle, valve-delay and derivative setting changes have their own checkpoint and sequence.
+  These records can expose occupancy, entity names and schedules.
 - A Diagnostics options page controls telemetry file logging (on by default) and optional debug
   sensors (off by default). Debug sensors expose the latest PID, estimator, valve-PWM and boiler
   records; enabling them without file logging retains data only in memory.
@@ -55,6 +63,13 @@
   current instrumentation gaps.
 
 ### Added: Replay, test coverage and deployment tooling
+- Adds offline reconstruction and continuity checks for the recorded configured-input stream,
+  selected persistent settings and preset/zone-mode/window-override state. These reconstruct
+  recorded state, as well as coordinator runtime control settings, not the full HA event loop
+  or physical equipment; missing tail records and unmonitored sources cannot be inferred.
+- Adds an offline calendar lifecycle continuity check for complete, non-overlapping recordings.
+  This checks snapshots and boundaries, not calendar calculations or external side effects;
+  calendar decision replay remains outstanding.
 - Added deterministic replay drivers for PID, PWM and rate estimators, synthetic room and sensor
   scenarios, and a frozen PID reference for differential tests. PID record replay starts at a
   clean-state boundary; dead-sensor records are skipped.
@@ -76,10 +91,11 @@
   checking the recorded wait duration and replaying the recorded switch-path decision separately.
   Consecutive delayed cycles are replayed individually with backend and PWM continuity checks.
 - Replays sequential plant updates against one relay backend while a single delayed task is pending,
-  including cancellation of an already-waiting task by the final update, with recorded wait and
-  state checks. A cancellation not caused by a replayed update can be injected into the waiting
-  task, but its source is unknown. Unsupported overlaps are rejected; this is not full asynchronous
-  plant reconstruction.
+  including cancellation of an already-waiting task by the final update or a master-off action,
+  with recorded wait and state checks. Master-off replay covers supported service errors and
+  cancellation, including the delay task finishing during the off service call. Other cancellation
+  can be injected into the waiting task, but its source is unknown. Unsupported overlaps are
+  rejected; this is not full asynchronous plant reconstruction.
 - Replays consecutive non-overlapping waiting cycles with backend and PWM continuity checks; each
   cycle is independently seeded rather than sharing a backend across the entire recording.
 - Replays individual schedule evaluations from effective recorded inputs, including profile expiry,
@@ -88,6 +104,11 @@
   replay checks lifecycle and state continuity and accepts saved-configuration checkpoints;
   manual override set/clear mutations are recorded and linked to evaluations. Other override and
   configuration lifecycles are not fully reconstructed.
+- Links non-overlapping OpenTherm updates by backend epoch and step, checks command and status
+  continuity, and validates individually replayed results, including supported service failures
+  and cancellation. Non-overlapping emergency-off actions are replayed through the real emergency
+  method and nested update; these operations can be linked to separately replayed plant decisions.
+  Overlapping calls remain unsupported.
 - Added strict expected-failure tests for known PID, PWM, estimator, sync and simulated plant
   defects. `pytest --show-red` runs these as ordinary failing tests. Simulated plant results are
   not a substitute for real installation validation.
@@ -98,8 +119,9 @@
   optional telemetry snapshots. It polls, can miss short transitions, and cannot establish
   physical valve position or flow.
 - Current replay and numerical coverage still require validation against installation telemetry
-  and independent ground-truth datasets. Some test ordering under parallel `pytest-xdist` runs
-  can expose Home Assistant mock leakage; a passing parallel run does not resolve that issue.
+  and independent ground-truth datasets.
+- Test modules now use the shared Home Assistant stubs instead of installing process-wide mock
+  import finders, avoiding a known order-dependent number-entity failure in parallel test runs.
 
 ### Refactor: Pluggable heating/cooling rate estimators
 - New `rate_estimators.py` defines the estimator contract (`update(ts, temp, is_heating)`, `heating_rate`, `cooling_rate`, optional `dump_state`/`load_state`), a registry (`register_estimator`) and the original algorithm as `LegacyEmaEstimator`, which remains the default so behaviour is unchanged.

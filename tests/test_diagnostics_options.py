@@ -72,7 +72,12 @@ def _fake_coordinator(tmp_path, telemetry_enabled, debug_sensors):
     hass = MagicMock()
     hass.config.path.return_value = str(tmp_path / "mzt_telemetry")
     return types.SimpleNamespace(hass=hass, telemetry_enabled=telemetry_enabled, debug_sensors=debug_sensors,
-                                 _unsub_listeners=[], _telemetry=None, _async_flush_telemetry=MagicMock())
+                                 _unsub_listeners=[], _telemetry=None, _async_flush_telemetry=MagicMock(),
+                                 _telemetry_settings_epoch="epoch", _telemetry_settings_step=0,
+                                 _telemetry_runtime_epoch="runtime", _telemetry_runtime_step=0,
+                                 _min_cycle_on=5, _min_cycle_off=5, _valve_delay=0,
+                                 _derivative_window_min=15, _derivative_limit_pct=15, _master_state=False,
+                                 _telemetry_control_config={}, zone_manager=MagicMock())
 
 
 @pytest.fixture

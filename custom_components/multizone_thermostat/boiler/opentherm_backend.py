@@ -3,6 +3,7 @@ import logging
 import time
 import asyncio
 from collections.abc import Mapping
+from uuid import uuid4
 
 from homeassistant.core import HomeAssistant
 from .base import BoilerBackend
@@ -33,6 +34,8 @@ class OpenThermBoilerBackend(BoilerBackend):
         self.ch_switch = ch_switch
         self._status_reason = "INIT"
         self._pending_command: tuple[str, float] | None = None
+        self._replay_epoch = uuid4().hex
+        self._replay_step = 0
 
     @property
     def status_reason(self) -> str:
@@ -41,6 +44,33 @@ class OpenThermBoilerBackend(BoilerBackend):
 
     async def async_update(self, demand: float, peak_zone: str | None, frost_emergency: bool) -> None:
         """Map demand to OpenTherm target temperature."""
+        step = self._replay_step
+        self._replay_step += 1
+        recorder = telemetry.get_recorder()
+        recorder.record(
+            telemetry.KIND_EVENT, "boiler", event="opentherm_update_start",
+            epoch=self._replay_epoch, step=step, demand=demand, peak_zone=peak_zone,
+            frost_emergency=frost_emergency,
+        )
+        completed, cancelled, error = False, False, None
+        try:
+            await self._async_update_impl(demand, peak_zone, frost_emergency)
+            completed = True
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as err:
+            error = str(err)
+            raise
+        finally:
+            recorder.record(
+                telemetry.KIND_EVENT, "boiler", event="opentherm_update_end",
+                epoch=self._replay_epoch, step=step, completed=completed, cancelled=cancelled,
+                error=error, reason=self._status_reason, pending_command=self._pending_command,
+            )
+
+    async def _async_update_impl(self, demand: float, peak_zone: str | None, frost_emergency: bool) -> None:
+        """Perform the OpenTherm update."""
         if not self.opentherm_entity:
             return
 
@@ -340,5 +370,27 @@ class OpenThermBoilerBackend(BoilerBackend):
 
     async def async_emergency_off(self) -> None:
         """Force OpenTherm boiler off immediately."""
-        self._status_reason = "OFF - Emergency/Master OFF"
-        await self.async_update(0.0, None, False)
+        recorder = telemetry.get_recorder()
+        step = self._replay_step
+        recorder.record(
+            telemetry.KIND_EVENT, "boiler", event="opentherm_emergency_start",
+            epoch=self._replay_epoch, step=step, reason=self._status_reason,
+            pending_command=self._pending_command,
+        )
+        completed, cancelled, error = False, False, None
+        try:
+            self._status_reason = "OFF - Emergency/Master OFF"
+            await self.async_update(0.0, None, False)
+            completed = True
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as err:
+            error = str(err)
+            raise
+        finally:
+            recorder.record(
+                telemetry.KIND_EVENT, "boiler", event="opentherm_emergency_end",
+                epoch=self._replay_epoch, step=step, completed=completed, cancelled=cancelled,
+                error=error, reason=self._status_reason, pending_command=self._pending_command,
+            )

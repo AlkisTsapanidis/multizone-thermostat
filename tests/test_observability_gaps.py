@@ -15,7 +15,7 @@ from custom_components.multizone_thermostat.climate import MultizoneVirtualTherm
 from custom_components.multizone_thermostat.boiler.opentherm_backend import OpenThermBoilerBackend
 from custom_components.multizone_thermostat.boiler.plant_orchestrator import PlantOrchestrator
 from custom_components.multizone_thermostat.boiler.relay_backend import RelayBoilerBackend
-from custom_components.multizone_thermostat.coordinator import MultizoneCoordinator
+from custom_components.multizone_thermostat.coordinator import MultizoneCoordinator, snapshot_control_config
 from custom_components.multizone_thermostat.demand_aggregator import DemandAggregator
 from custom_components.multizone_thermostat.plant_diagnostics.anomalies import get_opentherm_diagnostics
 from custom_components.multizone_thermostat.safety.anti_seize import AntiSeizeManager
@@ -27,6 +27,7 @@ from custom_components.multizone_thermostat.zone_manager import ZoneManager
 from tests.mzt_replay.drivers import (
     replay_aggregation_from_records, replay_estimator_from_records, replay_opentherm_targets_from_records,
     replay_opentherm_commands_from_records, replay_opentherm_diagnostics_from_records,
+    replay_stateful_opentherm_from_records, replay_linked_opentherm_plant_from_records,
     replay_frost_checks_from_records, replay_frost_scans_from_records, replay_anti_seize_from_records,
     replay_plant_decisions_from_records,
     replay_linked_plant_pwm_from_records, replay_linked_relay_plant_from_records,
@@ -36,6 +37,10 @@ from tests.mzt_replay.drivers import (
     replay_relay_delayed_commands_from_records,
     replay_single_delayed_plant_from_records, replay_sequential_delayed_plant_from_records,
     replay_waiting_delayed_plant_from_records, replay_sequential_waiting_plant_from_records,
+)
+from tests.mzt_replay.history import (
+    reconstruct_configured_inputs, reconstruct_persistent_settings, reconstruct_preset_history,
+    reconstruct_runtime_control_settings,
 )
 
 
@@ -715,7 +720,88 @@ async def test_delayed_plant_replays_updates_while_waiting(recorder, wait_before
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("first_outcome", ["completed", "cancel_by_update", "external_cancel"])
+@pytest.mark.parametrize("outcome", [
+    "already_off", "completed", "error", "cancelled", "overlap", "overlap_error", "overlap_cancelled",
+])
+async def test_waiting_delay_master_off_replays_real_emergency_path(recorder, outcome):
+    """ASHRAE Addendum y §5.21.2 and §5.21.11: adapted emergency-off lifecycle."""
+    from custom_components.multizone_thermostat import pwm_engine
+    from custom_components.multizone_thermostat.boiler import relay_backend as relay_module
+    from tests.mzt_replay.clock import ManualClock, patched_time
+
+    clock = ManualClock(start=100)
+    recorder._mono = clock.monotonic
+    states = {"switch.boiler": "off", "switch.valve": "on"}
+    master = {"on": True}
+    hass = MagicMock()
+    hass.states.get.side_effect = lambda entity: SimpleNamespace(state=states[entity], attributes={})
+    async def call(domain, service, data, **kwargs):
+        if outcome.startswith("overlap"):
+            await asyncio.sleep(0)
+        if outcome in ("error", "overlap_error"):
+            raise RuntimeError("emergency service failed")
+        if outcome in ("cancelled", "overlap_cancelled"):
+            raise asyncio.CancelledError
+        states[data["entity_id"]] = "off"
+    hass.services.async_call = call
+    hass.async_create_task = asyncio.create_task
+    zones = [{"name": "A", "switch_entities": ["switch.valve"]}]
+    agg = DemandAggregator(zones)
+    cid = next(iter(agg.get_all_demands()))
+    agg.set_zone_demand(cid, 100)
+    diag = SimpleNamespace(_current_boiler_start=None, has_critical_sensor_fault=lambda _: False,
+                           record_boiler_state=lambda _: None)
+    coord = SimpleNamespace(
+        zones=zones, _climate_entities={}, _climate_callbacks={}, is_dhw_active=False,
+        get_master_state=lambda: master["on"], plant_diagnostics=diag,
+        get_zone_mode=agg.get_zone_mode, get_zone_demand=agg.get_zone_demand,
+        record_diagnostic_event=lambda *_: None, reset_last_active_time=lambda: None,
+    )
+    async def sleep(_):
+        await asyncio.get_running_loop().create_future()
+    shim = SimpleNamespace(sleep=sleep, current_task=asyncio.current_task, CancelledError=asyncio.CancelledError)
+    with patch.object(relay_module, "asyncio", shim), patched_time(relay_module, clock), patched_time(pwm_engine, clock):
+        backend = RelayBoilerBackend(hass, coord, "switch.boiler", 0, 0, 30)
+        plant = PlantOrchestrator(hass, agg, backend, coord)
+        await plant._async_update_boiler()
+        task = backend._pending_boiler_task
+        await asyncio.sleep(0)
+        clock.advance(10)
+        agg.set_zone_demand(cid, 75)
+        await plant._async_update_boiler()
+        master["on"] = False
+        if outcome != "already_off":
+            states["switch.boiler"] = "on"
+        if outcome in ("error", "overlap_error"):
+            with pytest.raises(RuntimeError, match="emergency service failed"):
+                await plant._async_update_boiler()
+        elif outcome in ("cancelled", "overlap_cancelled"):
+            with pytest.raises(asyncio.CancelledError):
+                await plant._async_update_boiler()
+        else:
+            await plant._async_update_boiler()
+        await task
+    records = all_records(recorder)
+    telemetry.set_recorder(None)
+    replayed = await replay_waiting_delayed_plant_from_records(records)
+    assert replayed["cancellation_source"] == "emergency_off"
+    assert replayed["final_state"]["reason"] == "OFF - Emergency/Master OFF"
+    assert replayed["final_state"]["delay_pending"] is False
+    assert "emergency" in replayed["updates"][-1]
+    broken = deepcopy(records)
+    next(row for row in broken if row["data"].get("event") == "relay_emergency_off")["data"]["before"]["last_change"] += 1
+    with pytest.raises(ValueError, match="divergent previous backend state"):
+        await replay_waiting_delayed_plant_from_records(broken)
+    broken = deepcopy(records)
+    next(row for row in broken if row["data"].get("event") == "relay_emergency_off")["data"]["trace"] = []
+    with pytest.raises(ValueError):
+        await replay_waiting_delayed_plant_from_records(broken)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_outcome", [
+    "completed", "cancel_by_update", "external_cancel", "master_off", "master_off_overlap",
+])
 async def test_sequential_waiting_plant_cycles_preserve_backend_continuity(recorder, first_outcome):
     """ASHRAE Addendum y §4.11 and §5.21.2.4: adapted delayed relay lifecycle."""
     from custom_components.multizone_thermostat import pwm_engine
@@ -725,9 +811,12 @@ async def test_sequential_waiting_plant_cycles_preserve_backend_continuity(recor
     clock = ManualClock(start=100)
     recorder._mono = clock.monotonic
     states = {"switch.boiler": "off", "switch.valve": "on"}
+    master = {"on": True}
     hass = MagicMock()
     hass.states.get.side_effect = lambda entity: SimpleNamespace(state=states[entity], attributes={})
     async def call(domain, service, data, **kwargs):
+        if first_outcome == "master_off_overlap" and service == "turn_off":
+            await asyncio.sleep(0)
         states[data["entity_id"]] = "on" if service == "turn_on" else "off"
     hass.services.async_call = call
     hass.async_create_task = asyncio.create_task
@@ -738,7 +827,7 @@ async def test_sequential_waiting_plant_cycles_preserve_backend_continuity(recor
                            record_boiler_state=lambda _: None)
     coord = SimpleNamespace(
         zones=zones, _climate_entities={}, _climate_callbacks={}, is_dhw_active=False,
-        get_master_state=lambda: True, plant_diagnostics=diag,
+        get_master_state=lambda: master["on"], plant_diagnostics=diag,
         get_zone_mode=agg.get_zone_mode, get_zone_demand=agg.get_zone_demand,
         record_diagnostic_event=lambda *_: None, reset_last_active_time=lambda: None,
     )
@@ -761,6 +850,12 @@ async def test_sequential_waiting_plant_cycles_preserve_backend_continuity(recor
             await plant._async_update_boiler()
             if index == 0 and first_outcome == "external_cancel":
                 task.cancel()
+            elif index == 0 and first_outcome in ("master_off", "master_off_overlap"):
+                master["on"] = False
+                if first_outcome == "master_off_overlap":
+                    states["switch.boiler"] = "on"
+                await plant._async_update_boiler()
+                master["on"] = True
             elif index != 0 or first_outcome == "completed":
                 clock.advance(20)
                 waiters[-1].set_result(None)
@@ -771,10 +866,14 @@ async def test_sequential_waiting_plant_cycles_preserve_backend_continuity(recor
     telemetry.set_recorder(None)
     replayed = await replay_sequential_waiting_plant_from_records(records)
     assert len(replayed) == 2
-    assert [len(row["updates"]) for row in replayed] == [2, 2]
+    assert [len(row["updates"]) for row in replayed] == [
+        3 if first_outcome in ("master_off", "master_off_overlap") else 2, 2,
+    ]
     assert replayed[1]["cycle"]["commands"][0][1] == "turn_on"
     if first_outcome != "completed":
-        assert replayed[0]["cancellation_source"] == ("update" if first_outcome == "cancel_by_update" else "unknown")
+        expected = {"cancel_by_update": "update", "external_cancel": "unknown",
+                    "master_off": "emergency_off", "master_off_overlap": "emergency_off"}
+        assert replayed[0]["cancellation_source"] == expected[first_outcome]
     broken = deepcopy(records)
     [row for row in broken if row["kind"] == "boiler"][2]["data"]["replay_before"]["last_change"] += 1
     with pytest.raises(ValueError, match="divergent previous backend state"):
@@ -887,6 +986,197 @@ def test_estimator_restored_state_replays_and_midstream_restore_rejects(recorder
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "unavailable", "error", "cancelled"])
+async def test_stateful_opentherm_master_off_replays_emergency_lifecycle(recorder, outcome):
+    """ASHRAE Addendum y §5.21.2 and §5.21.10: adapted master-off command lifecycle."""
+    hass = MagicMock()
+    observed = {"state": "off"}
+    hass.states.get.side_effect = lambda _: SimpleNamespace(
+        state=observed["state"], attributes={"temperature": 30}, domain="climate",
+    )
+    hass.services.async_call = AsyncMock()
+    master = {"on": True}
+    coord = SimpleNamespace(
+        plant_diagnostics=None, weather_sensor_id=None, zones=[], _climate_entities={},
+        _climate_callbacks={}, is_dhw_active=False, get_master_state=lambda: master["on"],
+    )
+    agg = DemandAggregator([{"name": "A"}])
+    agg.set_zone_demand(next(iter(agg.get_all_demands())), 100)
+    backend = OpenThermBoilerBackend(hass, coord, "climate.boiler", 35, 75)
+    plant = PlantOrchestrator(hass, agg, backend, coord)
+    await plant._async_update_boiler()
+    master["on"] = False
+    observed["state"] = "unavailable" if outcome == "unavailable" else "heat"
+    if outcome == "error":
+        hass.services.async_call.side_effect = RuntimeError("off service failed")
+    elif outcome == "cancelled":
+        hass.services.async_call.side_effect = asyncio.CancelledError
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await plant._async_update_boiler()
+    else:
+        await plant._async_update_boiler()
+    hass.services.async_call.side_effect = None
+    observed["state"] = "off"
+    master["on"] = True
+    await plant._async_update_boiler()
+    records = all_records(recorder)
+    telemetry.set_recorder(None)
+    replayed = await replay_stateful_opentherm_from_records(records)
+    assert len(replayed) == 3
+    linked = await replay_linked_opentherm_plant_from_records(records)
+    assert [row["action"] for row in linked] == ["update", "emergency_off", "update"]
+    emergency = replayed[1]
+    assert emergency["emergency_start"]["data"]["step"] == 1
+    assert emergency["emergency_end"]["data"]["cancelled"] is (outcome == "cancelled")
+    assert emergency["observation"]["data"]["reason_before"] == "OFF - Emergency/Master OFF"
+    assert emergency["result"]["cancelled"] is (outcome == "cancelled")
+    if outcome == "error":
+        assert emergency["observation"]["data"]["command_error"] == "off service failed"
+    broken = deepcopy(records)
+    next(row for row in broken if row["data"].get("event") == "opentherm_emergency_start")["data"]["reason"] = "forged"
+    with pytest.raises(ValueError, match="divergent previous backend state"):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = deepcopy(records)
+    next(row for row in broken if row["data"].get("event") == "opentherm_emergency_end")["data"]["reason"] = "forged"
+    with pytest.raises(ValueError, match="emergency-off diverged"):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = [row for row in records if row["data"].get("event") != "opentherm_emergency_end"]
+    with pytest.raises(ValueError):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = [row for row in records if not (row["kind"] == "plant" and row["data"]["action"] == "master_off")]
+    with pytest.raises(ValueError, match="unmatched decisions or operations"):
+        await replay_linked_opentherm_plant_from_records(broken)
+    broken = deepcopy(records)
+    [row for row in broken if row["kind"] == "plant"][1]["data"]["action"] = "anti_seize"
+    with pytest.raises(ValueError, match="mismatched backend action"):
+        await replay_linked_opentherm_plant_from_records(broken)
+    broken = deepcopy(records)
+    first_end = next(row for row in broken if row["data"].get("event") == "opentherm_update_end")
+    second_plant = [row for row in broken if row["kind"] == "plant"][1]
+    first_end["seq"], second_plant["seq"] = second_plant["seq"], first_end["seq"]
+    broken.sort(key=lambda row: row["seq"])
+    with pytest.raises(ValueError, match="overlapping or reordered operations"):
+        await replay_linked_opentherm_plant_from_records(broken)
+
+
+@pytest.mark.asyncio
+async def test_stateful_opentherm_rejects_emergency_off_overlapping_update(recorder):
+    """ASHRAE Addendum y §5.21.10: adapted interrupted-command observability."""
+    hass = MagicMock()
+    hass.states.get.return_value = SimpleNamespace(state="heat", attributes={"temperature": 30}, domain="climate")
+    gate = asyncio.get_running_loop().create_future()
+    entered = asyncio.Event()
+    async def service(*args, **kwargs):
+        entered.set()
+        await gate
+    hass.services.async_call = service
+    backend = OpenThermBoilerBackend(
+        hass, SimpleNamespace(plant_diagnostics=None, weather_sensor_id=None), "climate.boiler", 35, 75,
+    )
+    update = asyncio.create_task(backend.async_update(50, "A", False))
+    await entered.wait()
+    emergency = asyncio.create_task(backend.async_emergency_off())
+    await asyncio.sleep(0)
+    gate.set_result(None)
+    await asyncio.gather(update, emergency)
+    records = all_records(recorder)
+    telemetry.set_recorder(None)
+    with pytest.raises(ValueError, match="non-overlapping start"):
+        await replay_stateful_opentherm_from_records(records)
+
+
+@pytest.mark.asyncio
+async def test_stateful_opentherm_replays_updates_and_rejects_missing_boundaries(recorder):
+    """ASHRAE Addendum y §5.21.10 and §5.21.11: adapted command lifecycle replay."""
+    hass = MagicMock()
+    observed = {"state": "off"}
+    hass.states.get.side_effect = lambda _: SimpleNamespace(
+        state=observed["state"], attributes={"temperature": 30}, domain="climate",
+    )
+    hass.services.async_call = AsyncMock()
+    backend = OpenThermBoilerBackend(
+        hass, SimpleNamespace(plant_diagnostics=None, weather_sensor_id=None), "climate.boiler", 35, 75,
+    )
+    await backend.async_update(50, "A", False)
+    observed["state"] = "unavailable"
+    await backend.async_update(0, "A", False)
+    observed["state"] = "off"
+    hass.services.async_call.side_effect = RuntimeError("gateway unavailable")
+    await backend.async_update(50, "A", False)
+    hass.services.async_call.side_effect = asyncio.CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await backend.async_update(50, "A", False)
+    rows = all_records(recorder)
+    telemetry.set_recorder(None)
+    replayed = await replay_stateful_opentherm_from_records(rows)
+    assert [row["start"]["data"]["step"] for row in replayed] == [0, 1, 2, 3]
+    assert [row["observation"]["data"]["action"] for row in replayed] == [
+        "update", "unavailable", "update", "update",
+    ]
+    assert replayed[-1]["result"]["cancelled"]
+    broken = deepcopy(rows)
+    broken = [row for row in broken if row["data"].get("step") != 1
+              and not (row["kind"] == "opentherm" and row["data"]["action"] == "unavailable")]
+    with pytest.raises(ValueError, match="missing or duplicate update step"):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = deepcopy(rows)
+    last = [row for row in broken if row["kind"] == "opentherm"][-1]
+    last["data"]["reason_before"] = "forged"
+    with pytest.raises(ValueError, match="divergent previous backend state"):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = deepcopy(rows)
+    broken.pop()
+    with pytest.raises(ValueError, match="incomplete update"):
+        await replay_stateful_opentherm_from_records(broken)
+    broken = deepcopy(rows)
+    [row for row in broken if row["data"].get("event") == "opentherm_update_end"][0]["data"]["reason"] = "forged"
+    with pytest.raises(ValueError, match="diverged during stateful replay"):
+        await replay_stateful_opentherm_from_records(broken)
+
+
+@pytest.mark.asyncio
+async def test_stateful_opentherm_rejects_overlapping_updates_and_unlogged_steps(recorder):
+    """ASHRAE Addendum y §5.21.10: adapted observation of overlapping commands."""
+    hass = MagicMock()
+    hass.states.get.return_value = SimpleNamespace(state="off", attributes={"temperature": 30}, domain="climate")
+    gate = asyncio.get_running_loop().create_future()
+    entered = asyncio.Event()
+    async def service(*args, **kwargs):
+        entered.set()
+        await gate
+    hass.services.async_call = service
+    backend = OpenThermBoilerBackend(
+        hass, SimpleNamespace(plant_diagnostics=None, weather_sensor_id=None), "climate.boiler", 35, 75,
+    )
+    first = asyncio.create_task(backend.async_update(50, "A", False))
+    await entered.wait()
+    second = asyncio.create_task(backend.async_update(50, "A", False))
+    await asyncio.sleep(0)
+    gate.set_result(None)
+    await asyncio.gather(first, second)
+    rows = all_records(recorder)
+    telemetry.set_recorder(None)
+    with pytest.raises(ValueError, match="overlapping or incomplete updates"):
+        await replay_stateful_opentherm_from_records(rows)
+    backend = OpenThermBoilerBackend(
+        hass, SimpleNamespace(plant_diagnostics=None, weather_sensor_id=None), "climate.boiler", 35, 75,
+    )
+    telemetry.set_recorder(recorder)
+    await backend.async_update(50, "A", False)
+    telemetry.set_recorder(None)
+    await backend.async_update(50, "A", False)
+    telemetry.set_recorder(recorder)
+    await backend.async_update(50, "A", False)
+    rows = all_records(recorder)
+    telemetry.set_recorder(None)
+    rows = rows[next(i for i, row in enumerate(rows)
+                     if row["data"].get("epoch") == backend._replay_epoch):]
+    with pytest.raises(ValueError, match="missing or duplicate update step"):
+        await replay_stateful_opentherm_from_records(rows)
+
+
+@pytest.mark.asyncio
 async def test_opentherm_target_replay_from_real_records(recorder):
     """ASHRAE Addendum y §5.21.4: adapted mapping, not trim-and-respond."""
     hass = MagicMock()
@@ -912,8 +1202,8 @@ async def test_opentherm_target_replay_from_real_records(recorder):
     telemetry.set_recorder(None)
     command_replay = await replay_opentherm_commands_from_records(rows)
     assert len(command_replay) == 4
-    assert command_replay[-1][1]["reason"] == rows[-1]["data"]["reason"]
-    del rows[0]["data"]["weather_cooling_rates"]
+    assert command_replay[-1][1]["reason"] == command_replay[-1][0]["data"]["reason"]
+    del next(row for row in rows if row["kind"] == "opentherm")["data"]["weather_cooling_rates"]
     with pytest.raises(ValueError, match="missing replay fields"):
         await replay_opentherm_targets_from_records(rows)
 
@@ -941,6 +1231,7 @@ async def test_opentherm_command_replay_uses_real_inputs_and_outcomes(recorder, 
     rows = all_records(recorder)
     telemetry.set_recorder(None)
     result = (await replay_opentherm_commands_from_records(rows))[0][1]
+    rows = [row for row in rows if row["kind"] == "opentherm"]
     assert result["reason"] == backend.status_reason
     assert result["pending_command"] == backend._pending_command
     assert len(result["commands"]) == hass.services.async_call.await_count
@@ -989,6 +1280,7 @@ async def test_opentherm_command_replay_preserves_pending_timeout_and_recovery(r
     rows = all_records(recorder)
     telemetry.set_recorder(None)
     results = await replay_opentherm_commands_from_records(rows)
+    rows = [row for row in rows if row["kind"] == "opentherm"]
     for row, result in results:
         assert result["reason"] == row["data"]["reason"]
         expected = row["data"]["pending_command"]
@@ -1094,14 +1386,18 @@ def test_configured_input_listener_records_initial_and_changes(recorder):
     coord.opentherm_ch_switch = None
     coord.weather_sensor_id = "sensor.outside"
     coord.presence_sensor = None
-    coord.zones = [{"name": "A", "temp_sensor": "sensor.room", "switch_entities": ["switch.valve"]}]
+    coord.zones = [{"name": "A", "temp_sensor": "sensor.room", "switch_entities": ["switch.valve"],
+                    "climate_id": "climate.custom",
+                    "calibrations": {"climate.trv": "number.calibration"}}]
     coord._unsub_listeners = []
+    coord._telemetry_input_epoch = "epoch"
+    coord._telemetry_input_step = 0
     coord.hass = MagicMock()
     coord.hass.states.get.return_value = SimpleNamespace(
-        state="12", attributes={"temperature": 12, "private": "do not log"},
+        state="12", attributes={"temperature": 12, "private": "do not log", "hvac_modes": ["heat", "off"]},
     )
-    coord._record_telemetry_input = lambda entity, state, source: (
-        MultizoneCoordinator._record_telemetry_input(coord, entity, state, source)
+    coord._record_telemetry_input = lambda entity, state, source, **kwargs: (
+        MultizoneCoordinator._record_telemetry_input(coord, entity, state, source, **kwargs)
     )
     coord._record_telemetry_input_event = lambda event: (
         MultizoneCoordinator._record_telemetry_input_event(coord, event)
@@ -1109,13 +1405,93 @@ def test_configured_input_listener_records_initial_and_changes(recorder):
     with patch("custom_components.multizone_thermostat.coordinator.async_track_state_change_event") as tracker:
         MultizoneCoordinator._start_telemetry_inputs(coord)
     tracked = tracker.call_args.args[1]
-    assert tracked == ["climate.multizone_thermostat_a", "sensor.outside", "sensor.room",
+    assert tracked == ["climate.custom", "climate.multizone_thermostat_a", "number.calibration", "sensor.outside", "sensor.room",
                        "switch.boiler", "switch.valve"]
-    coord._record_telemetry_input_event(SimpleNamespace(data={"entity_id": "sensor.room", "new_state": None}))
-    rows = [r["data"] for r in all_records(recorder)]
-    assert len(rows) == 6 and rows[0]["observation"] == "initial"
-    assert rows[-1]["observation"] == "change" and rows[-1]["state"] is None
+    coord._record_telemetry_input_event(SimpleNamespace(data={
+        "entity_id": "sensor.room", "old_state": coord.hass.states.get.return_value, "new_state": None,
+    }))
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    restored = SimpleNamespace(state="unavailable", attributes={}, last_changed=timestamp, last_updated=timestamp)
+    coord._record_telemetry_input_event(SimpleNamespace(
+        data={"entity_id": "sensor.room", "old_state": None, "new_state": restored}, time_fired=timestamp,
+    ))
+    coord.hass.states.get.return_value.attributes["hvac_modes"].append("private-after-recording")
+    rows = [r["data"] for r in all_records(recorder) if r["kind"] == "sensor"]
+    assert len(rows) == 9 and rows[0]["observation"] == "initial"
+    assert rows[-2]["observation"] == "change" and rows[-2]["state"] is None
+    assert rows[-1]["state"] == "unavailable" and rows[-1]["event_time"] == timestamp.isoformat()
     assert all("private" not in repr(row) for row in rows)
+    records = all_records(recorder)
+    history = reconstruct_configured_inputs(records)
+    assert history[-2]["entity"] == "sensor.room" and not history[-2]["state"]["present"]
+    assert history[-1]["state"]["last_updated"] == timestamp.isoformat()
+    missing = [row for row in records if row["data"].get("step") != 2]
+    with pytest.raises(ValueError, match="missing step"):
+        reconstruct_configured_inputs(missing)
+    changed = deepcopy(records)
+    last = next(r for r in changed if r["data"].get("observation") == "change")
+    last["data"]["old"]["state"] = "wrong"
+    with pytest.raises(ValueError, match="previous state"):
+        reconstruct_configured_inputs(changed)
+
+
+def test_control_config_snapshot_copies_calibrations_and_presence_without_unrelated_data():
+    config = {
+        "presence_sensor": "person.home", "geofencing_enabled": True, "private": "secret",
+        "zones": [{"name": "A", "climate_id": "climate.custom",
+                   "calibrations": {"climate.trv": "number.calibration"}}],
+    }
+    snapshot = snapshot_control_config(config)
+    config["zones"][0]["calibrations"]["climate.trv"] = "number.changed"
+    assert snapshot["presence_sensor"] == "person.home"
+    assert snapshot["geofencing_enabled"] is True
+    assert snapshot["zones"][0]["climate_id"] == "climate.custom"
+    assert snapshot["zones"][0]["calibrations"] == {"climate.trv": "number.calibration"}
+    assert "secret" not in repr(snapshot)
+
+
+def test_sensor_history_preserves_nonfinite_values(recorder):
+    coord = object.__new__(MultizoneCoordinator)
+    coord._telemetry_input_epoch, coord._telemetry_input_step = "epoch", 0
+    initial = SimpleNamespace(state="heat", attributes={"current_temperature": math.nan})
+    changed = SimpleNamespace(state="unavailable", attributes={"current_temperature": math.inf})
+    recorder.record(telemetry.KIND_EVENT, None, event="configured_inputs_start",
+                    epoch="epoch", entities=["climate.a"])
+    coord._record_telemetry_input("climate.a", initial, "initial")
+    recorder.record(telemetry.KIND_EVENT, None, event="configured_inputs_ready",
+                    epoch="epoch", next_step=1)
+    coord._record_telemetry_input("climate.a", changed, "change", old_state=initial)
+    history = reconstruct_configured_inputs(all_records(recorder))
+    assert math.isnan(history[0]["state"]["attributes"]["current_temperature"])
+    assert history[1]["state"]["attributes"]["current_temperature"] == math.inf
+
+
+def test_runtime_control_history_tracks_actual_setting_changes(recorder):
+    coord = object.__new__(MultizoneCoordinator)
+    coord._telemetry_runtime_epoch = "epoch"
+    coord._telemetry_runtime_step = 0
+    coord._min_cycle_on, coord._min_cycle_off, coord._valve_delay = 5, 5, 0
+    coord._derivative_window_min, coord._derivative_limit_pct, coord._master_state = 15, 15, False
+    coord.zone_controller = SimpleNamespace(pids={})
+    coord.boiler_backend = MagicMock()
+    initial = {"min_cycle_on": 5, "min_cycle_off": 5, "valve_opening_delay": 0,
+               "derivative_window_min": 15, "derivative_limit_pct": 15, "master_enabled": False}
+    recorder.record(telemetry.KIND_CONFIG, None, source="startup", runtime_epoch="epoch",
+                    runtime_next_step=0, runtime_settings=initial)
+    coord.set_min_cycle_on(10)
+    coord.set_derivative_window(8)
+    coord.set_master_state(True)
+    rows = all_records(recorder)
+    history = reconstruct_runtime_control_settings(rows)
+    assert history[-1]["state"]["min_cycle_on"] == 10
+    assert history[-1]["state"]["derivative_window_min"] == 8
+    assert history[-1]["state"]["master_enabled"] is True
+    altered = deepcopy(rows)
+    next(r for r in altered if r["data"].get("key") == "derivative_window_min")["data"]["previous"] = 99
+    with pytest.raises(ValueError, match="previous value"):
+        reconstruct_runtime_control_settings(altered)
+    with pytest.raises(ValueError, match="missing"):
+        reconstruct_runtime_control_settings([r for r in rows if r["data"].get("step") != 1])
 
 
 @pytest.mark.asyncio
@@ -1123,15 +1499,143 @@ async def test_persistent_setting_record_is_after_save_and_does_not_log_complex_
     coordinator = SimpleNamespace(_settings={}, _settings_store=SimpleNamespace(async_save=AsyncMock()))
     await MultizoneCoordinator.async_set_persistent_data(coordinator, "frost_temperature", 5.0)
     await MultizoneCoordinator.async_set_persistent_data(coordinator, "private", {"token": "secret"})
-    rows = [r["data"] for r in all_records(recorder)]
+    rows = [r["data"] for r in all_records(recorder) if r["data"].get("source") == "persistent_setting"]
     assert rows[0]["value"] == 5.0
     assert rows[1] == {"source": "persistent_setting", "key": "private", "value_recorded": False}
     assert "secret" not in repr(rows)
     coordinator._settings_store.async_save.side_effect = RuntimeError("save failed")
     with pytest.raises(RuntimeError):
         await MultizoneCoordinator.async_set_persistent_data(coordinator, "test", 1)
-    assert len(all_records(recorder)) == 2
+    records = all_records(recorder)
+    assert len([r for r in records if r["data"].get("source") == "persistent_setting"]) == 2
+    assert records[-1]["data"]["completed"] is False
+    assert coordinator._settings["test"] == 1
 
+
+@pytest.mark.asyncio
+async def test_setting_history_tracks_mutation_before_failure_and_snapshots(recorder):
+    coord = SimpleNamespace(_settings={"frost_temperature": 4.0}, _settings_store=SimpleNamespace(
+        async_save=AsyncMock(),
+    ), _telemetry_settings_epoch="epoch", _telemetry_settings_step=0)
+    recorder.record(telemetry.KIND_CONFIG, None, source="startup", settings_epoch="epoch",
+                    settings_next_step=0, settings={"frost_temperature": 4.0})
+    await MultizoneCoordinator.async_set_persistent_data(coord, "frost_temperature", 5.0)
+    modes = {"climate.a": "primary"}
+    await MultizoneCoordinator.async_set_persistent_data(coord, "zone_modes", modes)
+    modes["climate.a"] = "bypass"
+    coord._settings_store.async_save.side_effect = RuntimeError("private failure")
+    with pytest.raises(RuntimeError):
+        await MultizoneCoordinator.async_set_persistent_data(coord, "frost_temperature", 6.0)
+    rows = all_records(recorder)
+    history = reconstruct_persistent_settings(rows)
+    assert history[0]["state"]["frost_temperature"]["value"] == 4.0
+    assert [item["current"]["value"] for item in history[1:]] == [
+        5.0, {"climate.a": "primary"}, 6.0,
+    ]
+    assert history[-1]["save"] == {"completed": False, "cancelled": False, "error": "RuntimeError"}
+    assert "private failure" not in repr(rows)
+    missing = [r for r in rows if not (r["data"].get("source") == "persistent_setting_mutation"
+                                       and r["data"].get("step") == 1)]
+    with pytest.raises(ValueError, match="missing step|outcome"):
+        reconstruct_persistent_settings(missing)
+
+
+def test_preset_checkpoint_and_mutations_reconstruct(recorder):
+    coord = MagicMock()
+    coord.zones = []
+    coord._select_entities = {}
+    coord._climate_callbacks = {}
+    coord.get_persistent_data.return_value = {}
+    hass = MagicMock()
+    manager = ZoneManager(hass, coord)
+    manager._presets = {"eco": {"climate.a": {"target_temp": 18.0, "private": "secret"}}}
+    manager.record_preset_checkpoint()
+    manager.set_global_preset("eco")
+    manager.update_preset_temperature("eco", "climate.a", 19.0)
+    manager.set_zone_mode("climate.a", "bypass")
+    rows = all_records(recorder)
+    history = reconstruct_preset_history(rows)
+    assert history[-1]["state"]["presets"]["eco"]["climate.a"] == {
+        "target_temp": 19.0, "mode": "bypass",
+    }
+    assert history[-1]["state"]["current_preset"] == "eco"
+    assert history[-1]["state"]["zone_modes"]["climate.a"] == "bypass"
+    assert "secret" not in repr(rows)
+    missing = [r for r in rows if not (r["data"].get("source") == "preset_change"
+                                       and r["data"].get("step") == 1)]
+    with pytest.raises(ValueError, match="missing step"):
+        reconstruct_preset_history(missing)
+
+
+def test_window_override_history_tracks_open_and_unavailable(recorder):
+    coord = MagicMock()
+    coord.zones = [{"name": "A", "window_sensor": "binary_sensor.window"}]
+    coord._select_entities = {}
+    coord._climate_callbacks = {}
+    coord.get_persistent_data.return_value = {}
+    coord.is_zone_in_frost_emergency.return_value = False
+    manager = ZoneManager(MagicMock(), coord)
+    manager.record_preset_checkpoint()
+    for state in ("on", "unavailable"):
+        manager.async_on_window_state_changed(SimpleNamespace(data={
+            "entity_id": "binary_sensor.window", "new_state": SimpleNamespace(state=state),
+        }))
+    history = reconstruct_preset_history(all_records(recorder))
+    zone = "climate.multizone_thermostat_a"
+    assert history[1]["state"]["pre_window_state"] == {zone: "primary"}
+    assert history[2]["state"]["zone_modes"][zone] == "bypass"
+    assert history[-1]["state"]["pre_window_state"] == {}
+    assert history[-1]["state"]["zone_modes"][zone] == "primary"
+
+
+@pytest.mark.asyncio
+async def test_setting_history_handles_interleaved_saves_and_cancellation(recorder):
+    gate, entered = asyncio.Event(), asyncio.Event()
+
+    async def save(_):
+        entered.set()
+        await gate.wait()
+
+    coord = SimpleNamespace(_settings={}, _settings_store=SimpleNamespace(async_save=save),
+                            _telemetry_settings_epoch="epoch", _telemetry_settings_step=0)
+    recorder.record(telemetry.KIND_CONFIG, None, source="startup", settings_epoch="epoch",
+                    settings_next_step=0, settings={})
+    first = asyncio.create_task(MultizoneCoordinator.async_set_persistent_data(coord, "frost_temperature", 5))
+    await entered.wait()
+    second = asyncio.create_task(MultizoneCoordinator.async_set_persistent_data(coord, "frost_temperature", 6))
+    await asyncio.sleep(0)
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+    gate.set()
+    await first
+    history = reconstruct_persistent_settings(all_records(recorder))
+    assert [item["current"]["value"] for item in history[1:]] == [5, 6]
+    assert history[1]["save"]["completed"] is True
+    assert history[2]["save"]["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_zone_mode_direct_write_and_save_are_both_in_setting_history(recorder):
+    coord = object.__new__(MultizoneCoordinator)
+    coord.zones = []
+    coord._settings = {"zone_modes": {"climate.a": "primary"}}
+    coord._settings_store = SimpleNamespace(async_save=AsyncMock())
+    coord._telemetry_settings_epoch, coord._telemetry_settings_step = "epoch", 0
+    coord._climate_callbacks = {}
+    coord.demand_aggregator = MagicMock()
+    coord._async_save_presets_storage = AsyncMock()
+    tasks = []
+    hass = SimpleNamespace(async_create_task=lambda coro: tasks.append(asyncio.create_task(coro)))
+    manager = ZoneManager(hass, coord)
+    recorder.record(telemetry.KIND_CONFIG, None, source="startup", settings_epoch="epoch",
+                    settings_next_step=0, settings={"zone_modes": {"climate.a": "primary"}})
+    manager.set_zone_mode("climate.a", "bypass", save_to_preset=False)
+    await asyncio.gather(*tasks)
+    history = reconstruct_persistent_settings(all_records(recorder))
+    assert history[1]["current"]["value"] == {"climate.a": "bypass"}
+    assert history[1]["save"] == {"scheduled_separately": True}
+    assert history[2]["save"]["completed"] is True
 
 @pytest.mark.asyncio
 async def test_schedule_records_are_snapshots_after_successful_save(recorder):

@@ -1361,7 +1361,9 @@ async def replay_opentherm_targets_from_records(records: Iterable[dict]) -> list
     return rows
 
 
-async def replay_opentherm_commands_from_records(records: Iterable[dict]) -> list[tuple[dict, dict]]:
+async def replay_opentherm_commands_from_records(
+    records: Iterable[dict], *, _emergency_before: dict | None = None,
+) -> list[tuple[dict, dict]]:
     """Replay OpenTherm updates against recorded state reads, clocks and service outcomes."""
     import asyncio
     from collections import deque
@@ -1431,14 +1433,20 @@ async def replay_opentherm_commands_from_records(records: Iterable[dict]) -> lis
         )
         backend = module.OpenThermBoilerBackend(hass, coordinator, data["entity"],
                                                data["min_temp"], data["max_temp"], data["ch_switch"])
-        backend._pending_command = tuple(data["pending_before"]) if data["pending_before"] is not None else None
-        backend._status_reason = data["reason_before"]
+        initial = _emergency_before if _emergency_before is not None else {
+            "pending_command": data["pending_before"], "reason": data["reason_before"],
+        }
+        backend._pending_command = tuple(initial["pending_command"]) if initial["pending_command"] is not None else None
+        backend._status_reason = initial["reason"]
         old_time = module.time
         module.time = SimpleNamespace(monotonic=lambda: take("clock")["value"])
         cancelled = False
         try:
             try:
-                await backend.async_update(data["demand"], data["peak_zone"], data["frost_emergency"])
+                if _emergency_before is not None:
+                    await backend.async_emergency_off()
+                else:
+                    await backend.async_update(data["demand"], data["peak_zone"], data["frost_emergency"])
             except asyncio.CancelledError:
                 cancelled = True
         finally:
@@ -1451,6 +1459,155 @@ async def replay_opentherm_commands_from_records(records: Iterable[dict]) -> lis
             "commands": commands, "reason": backend.status_reason,
             "pending_command": backend._pending_command, "cancelled": cancelled,
         }))
+    return results
+
+
+async def replay_stateful_opentherm_from_records(records: Iterable[dict]) -> list[dict]:
+    """Replay sequential OpenTherm updates and verify lifecycle and state continuity."""
+    records = list(records)
+    lifecycle = [
+        rec for rec in records if rec.get("kind") == "opentherm" or (
+            rec.get("kind") == "event" and rec.get("data", {}).get("event")
+            in ("opentherm_update_start", "opentherm_update_end",
+                "opentherm_emergency_start", "opentherm_emergency_end")
+        )
+    ]
+    seqs = [rec.get("seq") for rec in lifecycle]
+    if (any(not isinstance(seq, int) or isinstance(seq, bool) for seq in seqs)
+            or any(left >= right for left, right in zip(seqs, seqs[1:]))):
+        raise ValueError("OpenTherm recording has invalid or reordered sequence numbers")
+    pending = None
+    observation = None
+    epoch = None
+    seen_epochs = set()
+    next_step = None
+    previous = None
+    emergency = None
+    emergency_result = None
+    results = []
+    for rec in lifecycle:
+        data = rec.get("data", {})
+        event = data.get("event") if rec["kind"] == "event" else None
+        if event == "opentherm_emergency_start":
+            recorded_epoch, step = data.get("epoch"), data.get("step")
+            if (pending is not None or emergency is not None
+                    or not isinstance(recorded_epoch, str) or not recorded_epoch
+                    or not isinstance(step, int) or isinstance(step, bool) or step < 0
+                    or "reason" not in data or "pending_command" not in data):
+                raise ValueError("OpenTherm emergency-off lacks a non-overlapping start")
+            if recorded_epoch != epoch:
+                if recorded_epoch in seen_epochs:
+                    raise ValueError("OpenTherm recording has a reordered or overlapping epoch")
+                epoch, next_step, previous = recorded_epoch, step, None
+                seen_epochs.add(epoch)
+            if step != next_step:
+                raise ValueError("OpenTherm recording has a missing or duplicate update step")
+            if previous is not None and (
+                    data["reason"] != previous["reason"] or data["pending_command"] != previous["pending_command"]):
+                raise ValueError("OpenTherm emergency-off has divergent previous backend state")
+            emergency, emergency_result = rec, None
+        elif event == "opentherm_emergency_end":
+            if (emergency is None or pending is not None or emergency_result is None
+                    or data.get("epoch") != emergency["data"]["epoch"]
+                    or type(data.get("step")) is not int or data["step"] != emergency["data"]["step"]
+                    or any(key not in data for key in ("completed", "cancelled", "error", "reason",
+                                                        "pending_command"))):
+                raise ValueError("OpenTherm emergency-off lacks a matching lifecycle boundary")
+            update_end = emergency_result["end"]["data"]
+            if any(data[key] != update_end[key] for key in (
+                    "completed", "cancelled", "error", "reason", "pending_command")):
+                raise ValueError("OpenTherm emergency-off diverged during stateful replay")
+            emergency_result["emergency_start"] = emergency
+            emergency_result["emergency_end"] = rec
+            emergency, emergency_result = None, None
+        elif event == "opentherm_update_start":
+            recorded_epoch, step = data.get("epoch"), data.get("step")
+            if pending is not None:
+                raise ValueError("OpenTherm recording has overlapping or incomplete updates")
+            if (not isinstance(recorded_epoch, str) or not recorded_epoch
+                    or not isinstance(step, int) or isinstance(step, bool) or step < 0
+                    or any(key not in data for key in ("demand", "peak_zone", "frost_emergency"))):
+                raise ValueError("OpenTherm update lacks its lifecycle boundary")
+            if recorded_epoch != epoch:
+                if recorded_epoch in seen_epochs:
+                    raise ValueError("OpenTherm recording has a reordered or overlapping epoch")
+                epoch, next_step, previous = recorded_epoch, step, None
+                seen_epochs.add(epoch)
+            if step != next_step:
+                raise ValueError("OpenTherm recording has a missing or duplicate update step")
+            if emergency is not None and (
+                    emergency_result is not None or recorded_epoch != emergency["data"]["epoch"]
+                    or step != emergency["data"]["step"]
+                    or (data["demand"], data["peak_zone"], data["frost_emergency"]) != (0.0, None, False)):
+                raise ValueError("OpenTherm emergency-off has divergent nested update")
+            pending, observation = rec, None
+        elif rec["kind"] == "opentherm":
+            if pending is None or observation is not None:
+                raise ValueError("OpenTherm observation lacks a unique update boundary")
+            start = pending["data"]
+            if any(data.get(key) != start[key] for key in ("demand", "peak_zone", "frost_emergency")):
+                raise ValueError("OpenTherm update has divergent recorded inputs")
+            if data.get("action") not in ("update", "unavailable"):
+                raise ValueError("OpenTherm recording contains an unsupported action")
+            expected_before = (
+                {"reason": "OFF - Emergency/Master OFF",
+                 "pending_command": emergency["data"]["pending_command"]}
+                if emergency is not None else previous
+            )
+            if expected_before is not None and (
+                data.get("reason_before") != expected_before["reason"]
+                or data.get("pending_before") != expected_before["pending_command"]
+            ):
+                raise ValueError("OpenTherm update has divergent previous backend state")
+            observation = rec
+        else:
+            if (pending is None or observation is None or data.get("epoch") != epoch
+                    or not isinstance(data.get("step"), int) or isinstance(data.get("step"), bool)
+                    or data.get("step") != next_step
+                    or any(key not in data for key in ("completed", "cancelled", "error", "reason",
+                                                        "pending_command"))):
+                raise ValueError("OpenTherm update lacks a matching lifecycle boundary")
+            replayed = (await replay_opentherm_commands_from_records(
+                [observation], _emergency_before=emergency["data"] if emergency is not None else None,
+            ))[0][1]
+            recorded_pending = data.get("pending_command")
+            if recorded_pending is not None and (
+                    not isinstance(recorded_pending, (list, tuple)) or len(recorded_pending) != 2):
+                raise ValueError("OpenTherm update has invalid pending command")
+            expected_pending = tuple(recorded_pending) if recorded_pending is not None else None
+            completed = data.get("completed")
+            cancelled = data.get("cancelled")
+            error = data.get("error")
+            if (not isinstance(completed, bool) or not isinstance(cancelled, bool)
+                    or error is not None or completed == cancelled
+                    or replayed["cancelled"] != cancelled
+                    or replayed["reason"] != data.get("reason")
+                    or replayed["pending_command"] != expected_pending):
+                raise ValueError("OpenTherm update diverged during stateful replay")
+            observed = observation["data"]
+            if observed["action"] == "update":
+                recorded_after = observed.get("pending_command")
+                recorded_after = tuple(recorded_after) if recorded_after is not None else None
+                service_errors = [item.get("error") for item in observed["trace"]
+                                  if item.get("type") == "service" and item.get("outcome") == "error"]
+                service_cancelled = any(item.get("type") == "service" and item.get("outcome") == "cancelled"
+                                        for item in observed["trace"])
+                if (replayed["reason"] != observed.get("reason")
+                        or replayed["pending_command"] != recorded_after
+                        or len(service_errors) > 1 or any(not isinstance(err, str) for err in service_errors)
+                        or observed.get("command_error") != (service_errors[0] if service_errors else None)
+                        or observed.get("update_completed") is not (not service_errors and not service_cancelled)
+                        or service_cancelled != cancelled):
+                    raise ValueError("OpenTherm observation diverged during stateful replay")
+            previous = {"reason": data["reason"], "pending_command": recorded_pending}
+            row = {"start": pending, "observation": observation, "end": rec, "result": replayed}
+            results.append(row)
+            if emergency is not None:
+                emergency_result = row
+            pending, observation = None, None
+            next_step += 1
+    if pending is not None or emergency is not None:
+        raise ValueError("OpenTherm recording ends with an incomplete update")
     return results
 
 
@@ -1527,6 +1684,38 @@ async def replay_plant_decisions_from_records(records: Iterable[dict]) -> list[t
         else:
             rows.append((rec, "none", ()))
     return rows
+
+
+async def replay_linked_opentherm_plant_from_records(records: Iterable[dict]) -> list[dict]:
+    """Link sequential orchestrator decisions to checked OpenTherm lifecycles."""
+    records = list(records)
+    decisions = await replay_plant_decisions_from_records(records)
+    operations = await replay_stateful_opentherm_from_records(records)
+    plant_records = [rec for rec in records if rec.get("kind") == "plant"]
+    seqs = [rec.get("seq") for rec in plant_records]
+    if (any(not isinstance(seq, int) or isinstance(seq, bool) for seq in seqs)
+            or any(left >= right for left, right in zip(seqs, seqs[1:]))):
+        raise ValueError("OpenTherm plant recording has invalid or reordered sequence numbers")
+    if len(decisions) != len(operations):
+        raise ValueError("OpenTherm plant recording has unmatched decisions or operations")
+    results = []
+    previous_end = None
+    for (plant, action, args), operation in zip(decisions, operations):
+        emergency = operation.get("emergency_start")
+        start = emergency if emergency is not None else operation["start"]
+        end = operation.get("emergency_end", operation["end"])
+        if (previous_end is not None and plant["seq"] <= previous_end
+                or not plant["seq"] < start["seq"] < end["seq"]):
+            raise ValueError("OpenTherm plant recording has overlapping or reordered operations")
+        if action == "update" and emergency is None:
+            data = operation["start"]["data"]
+            if args != (data["demand"], data["peak_zone"], data["frost_emergency"]):
+                raise ValueError("OpenTherm plant decision has divergent update inputs")
+        elif action != "emergency_off" or emergency is None:
+            raise ValueError("OpenTherm plant decision has a mismatched backend action")
+        results.append({"plant": plant, "action": action, "operation": operation})
+        previous_end = end["seq"]
+    return results
 
 
 async def replay_linked_plant_pwm_from_records(
@@ -2117,7 +2306,7 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
     from custom_components.multizone_thermostat.boiler import relay_backend as module
 
     records = list(records)
-    decisions = await replay_linked_plant_pwm_from_records(records)
+    decisions = await replay_linked_plant_pwm_from_records(records, allow_emergency_off=True, allow_failed=True)
     cycles = await replay_relay_delayed_commands_from_records(records, _allow_wait_cancel_reason_change=True)
     if not decisions or len(cycles) != 1:
         raise ValueError("Waiting plant replay requires updates and one completed delay task")
@@ -2135,6 +2324,8 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
     terminal = cancellations[0] if cancelled_wait else expiries[0]
     check_record = None if cancelled_wait else checks[0]
     first = decisions[0]
+    if "boiler" not in first:
+        raise ValueError("Waiting plant recording must start with an update")
     before = first["boiler"]["data"].get("replay_before")
     if not isinstance(before, dict) or not isinstance(before.get("valve_delay"), (int, float)):
         raise ValueError("Waiting plant update lacks replay inputs")
@@ -2151,10 +2342,17 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
             or terminal["mono"] < waiting["mono"]
             or (not cancelled_wait and terminal["mono"] - waiting["mono"] + 1e-6 < delay)):
         raise ValueError("Waiting plant recording has an incomplete or premature delay")
+    overlap_emergency = False
     for row in decisions:
-        if (row["boiler"]["seq"] >= terminal["seq"]
-                or row["plant"]["seq"] < waiting["seq"] < row["boiler"]["seq"]):
+        end = row.get("boiler", row.get("emergency"))
+        during_emergency = (
+            cancelled_wait and "emergency" in row
+            and row["plant"]["seq"] < terminal["seq"] < finished["seq"] < end["seq"]
+        )
+        if ((end["seq"] >= terminal["seq"] and not during_emergency)
+                or row["plant"]["seq"] < waiting["seq"] < end["seq"]):
             raise ValueError("Waiting plant recording has overlapping updates or task execution")
+        overlap_emergency |= during_emergency
     check = check_record["data"] if check_record is not None else None
     path = None
     if check is not None and "switch_path" in check:
@@ -2232,7 +2430,74 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
 
     try:
         for index, row in enumerate(decisions):
+            if "emergency" in row:
+                record, data = row["emergency"], row["emergency"]["data"]
+                state, after, trace = data.get("before"), data.get("after"), data.get("trace")
+                fields = ("switch", "last_change", "pending_command", "last_known_on",
+                          "trv_wait_start", "delay_pending", "reason")
+                if (not cancelled_wait or cancelled_by_update or index != len(decisions) - 1
+                        or waiting["seq"] >= row["plant"]["seq"]
+                        or not isinstance(state, dict) or any(key not in state for key in fields)
+                        or not isinstance(after, dict) or not isinstance(trace, list)):
+                    raise ValueError("Waiting plant recording has an unsupported emergency-off boundary")
+                if waiter is None:
+                    await asyncio.sleep(0)
+                expected_before = (
+                    state["switch"], state["last_change"],
+                    tuple(state["pending_command"]) if state["pending_command"] is not None else None,
+                    state["last_known_on"], state["trv_wait_start"], state["delay_pending"], state["reason"],
+                )
+                actual_before = (
+                    backend.boiler_switch, backend._last_boiler_change, backend._pending_command,
+                    backend._last_known_boiler_on, backend._trv_wait_start,
+                    backend._pending_boiler_task is not None, backend.status_reason,
+                )
+                if waiter is None or actual_before != expected_before:
+                    raise ValueError("Waiting emergency-off has divergent previous backend state")
+                tape = _RelayReplayTape(record, trace)
+                hass.states.get = tape.read_state
+                if overlap_emergency:
+                    async def service_during_cancellation(*args, **kwargs):
+                        await asyncio.sleep(0)
+                        if not task.done():
+                            raise ValueError("Waiting task did not finish during emergency-off")
+                        await tape.service(*args, **kwargs)
+                    hass.services.async_call = service_during_cancellation
+                else:
+                    hass.services.async_call = tape.service
+                module.time = SimpleNamespace(monotonic=lambda: tape.take("clock")["value"])
+                outcome, error = "completed", None
+                try:
+                    await backend._async_emergency_off_impl()
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                except RuntimeError as err:
+                    outcome, error = "error", str(err)
+                expected_after = after.copy()
+                if expected_after.get("pending_command") is not None:
+                    expected_after["pending_command"] = tuple(expected_after["pending_command"])
+                actual_after = {
+                    "last_change": backend._last_boiler_change, "pending_command": backend._pending_command,
+                    "last_known_on": backend._last_known_boiler_on, "trv_wait_start": backend._trv_wait_start,
+                    "delay_pending": backend._pending_boiler_task is not None, "reason": backend.status_reason,
+                }
+                expected_outcome = (
+                    "completed" if data.get("completed") is True and data.get("cancelled") is False
+                    and data.get("error") is None else
+                    "cancelled" if data.get("completed") is False and data.get("cancelled") is True
+                    and data.get("error") is None else
+                    "error" if data.get("completed") is False and data.get("cancelled") is False
+                    and isinstance(data.get("error"), str) else None
+                )
+                if (tape.events or actual_after != expected_after or outcome != expected_outcome
+                        or error != data.get("error") or task is None or not task.cancelling()):
+                    raise ValueError("Waiting emergency-off diverged during backend replay")
+                cancelled_by_update = True
+                continue
             record, data = row["boiler"], row["boiler"]["data"]
+            if (data.get("update_completed") is not True or data.get("update_cancelled") is not False
+                    or data.get("update_error") is not None):
+                raise ValueError("Waiting plant update did not complete")
             if data["pwm_epoch"] != first["boiler"]["data"]["pwm_epoch"]:
                 raise ValueError("Waiting plant recording crosses a PWM epoch")
             state, after, trace = data.get("replay_before"), data.get("replay_after"), data.get("replay_trace")
@@ -2299,7 +2564,8 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
             if backend._pending_boiler_task is not None or backend.status_reason != cycle["cycle"]["reason"]:
                 raise ValueError("Waiting plant cancellation diverged during backend replay")
             return {"updates": decisions, "cycle": cycle,
-                    "cancellation_source": "update" if cancelled_by_update else "unknown",
+                    "cancellation_source": ("emergency_off" if "emergency" in decisions[-1] else "update")
+                    if cancelled_by_update else "unknown",
                     "final_state": final_state()}
         if waiter is None:
             await asyncio.sleep(0)
@@ -2349,7 +2615,7 @@ async def replay_waiting_delayed_plant_from_records(records: Iterable[dict]) -> 
 async def replay_sequential_waiting_plant_from_records(records: Iterable[dict]) -> list[dict]:
     """Replay non-overlapping waiting cycles, checking backend and PWM continuity."""
     records = list(records)
-    decisions = await replay_linked_plant_pwm_from_records(records)
+    decisions = await replay_linked_plant_pwm_from_records(records, allow_emergency_off=True, allow_failed=True)
     cycles = await replay_relay_delayed_commands_from_records(records, _allow_wait_cancel_reason_change=True)
     if not decisions or not cycles:
         raise ValueError("Waiting plant recording requires updates and delay tasks")
@@ -2358,15 +2624,17 @@ async def replay_sequential_waiting_plant_from_records(records: Iterable[dict]) 
     backend_epoch = None
     pwm_epoch = None
     next_decision = 0
+    previous_end_seq = None
     for cycle in cycles:
         scheduled, finished = cycle["cycle"]["records"][0], cycle["cycle"]["records"][-1]
         start_index = next_decision
-        while next_decision < len(decisions) and decisions[next_decision]["boiler"]["seq"] < finished["seq"]:
+        while next_decision < len(decisions) and decisions[next_decision]["plant"]["seq"] < finished["seq"]:
             next_decision += 1
         group = decisions[start_index:next_decision]
-        if not group or not group[0]["plant"]["seq"] < scheduled["seq"] < group[0]["boiler"]["seq"]:
+        if (not group or "boiler" not in group[0]
+                or not group[0]["plant"]["seq"] < scheduled["seq"] < group[0]["boiler"]["seq"]):
             raise ValueError("Waiting plant recording has unmatched or overlapping cycles")
-        if results and group[0]["plant"]["seq"] - 1 <= results[-1]["cycle"]["cycle"]["records"][-1]["seq"]:
+        if previous_end_seq is not None and group[0]["plant"]["seq"] - 1 <= previous_end_seq:
             raise ValueError("Waiting plant recording has overlapping cycles")
         current_backend_epoch = scheduled["data"]["epoch"]
         current_pwm_epoch = group[0]["boiler"]["data"]["pwm_epoch"]
@@ -2392,11 +2660,13 @@ async def replay_sequential_waiting_plant_from_records(records: Iterable[dict]) 
                 raise ValueError("Waiting plant recording has divergent previous backend state")
         start = next((i for i, rec in enumerate(records)
                       if rec.get("kind") == "aggregation" and rec.get("seq") == group[0]["plant"]["seq"] - 1), None)
-        end = next((i for i, rec in enumerate(records) if rec is finished), None)
+        end_seq = max(finished["seq"], *(row.get("boiler", row.get("emergency"))["seq"] for row in group))
+        end = next((i for i, rec in enumerate(records) if rec.get("seq") == end_seq), None)
         if start is None or end is None or start >= end:
             raise ValueError("Waiting plant recording has incomplete cycle boundaries")
         replayed = await replay_waiting_delayed_plant_from_records(records[start:end + 1])
         previous = replayed["final_state"]
+        previous_end_seq = end_seq
         results.append(replayed)
     if next_decision != len(decisions):
         raise ValueError("Waiting plant recording has unmatched updates or tasks")
@@ -2628,6 +2898,78 @@ async def replay_linked_smart_return_evaluations_from_records(records: Iterable[
                     raise ValueError(f"Schedule record {rec.get('seq')} lacks a unique matching smart-return plan")
             results.append({"evaluation": rec, "after": evaluation_by_id[id(rec)],
                             "plan": matching[0] if matching else None})
+    return results
+
+
+def verify_calendar_override_lifecycle_from_records(records: Iterable[dict]) -> list[dict]:
+    """Verify recorded calendar state continuity without reconstructing event decisions."""
+    events = [rec for rec in records if rec.get("kind") == "event" and rec.get("data", {}).get("event") in (
+        "calendar_processing_start", "calendar_processing_end", "calendar_overrides",
+    )]
+    if not events:
+        raise ValueError("Calendar recording has no processing events")
+    sequences = [rec.get("seq") for rec in events]
+    if (any(not isinstance(seq, int) or isinstance(seq, bool) for seq in sequences)
+            or any(left >= right for left, right in zip(sequences, sequences[1:]))):
+        raise ValueError("Calendar recording has invalid or reordered sequence numbers")
+    pending = None
+    snapshot = None
+    previous = None
+    epoch = None
+    next_step = None
+    seen_epochs = set()
+    results = []
+    fields = ("active_event_token", "pre_calendar_preset", "current", "smart_start", "modes")
+    for rec in events:
+        data = rec["data"]
+        event = data["event"]
+        if event == "calendar_overrides":
+            if (pending is None or snapshot is not None or data.get("epoch") != epoch
+                    or data.get("step") != next_step):
+                raise ValueError("Calendar snapshot lacks a unique processing boundary")
+            snapshot = rec
+            continue
+        recorded_epoch, step, state = data.get("epoch"), data.get("step"), data.get("state")
+        if (not isinstance(recorded_epoch, str) or not recorded_epoch
+                or not isinstance(step, int) or isinstance(step, bool) or step < 0
+                or "evaluated_at" not in data or data["evaluated_at"] is None
+                or not isinstance(state, dict) or any(key not in state for key in fields)
+                or any(not isinstance(state[key], dict) for key in ("current", "smart_start", "modes"))
+                or not (state["active_event_token"] is None or isinstance(state["active_event_token"], str))):
+            raise ValueError("Calendar processing boundary lacks valid state")
+        if event == "calendar_processing_start":
+            if pending is not None:
+                raise ValueError("Calendar recording has overlapping or incomplete processing")
+            if recorded_epoch != epoch:
+                if recorded_epoch in seen_epochs:
+                    raise ValueError("Calendar recording has a reordered or overlapping epoch")
+                epoch, next_step, previous = recorded_epoch, step, None
+                seen_epochs.add(epoch)
+            if step != next_step:
+                raise ValueError("Calendar recording has a missing or duplicate processing step")
+            if previous is not None and state != previous:
+                raise ValueError("Calendar processing has divergent previous state")
+            pending, snapshot = rec, None
+        else:
+            if (pending is None or recorded_epoch != epoch or step != next_step
+                    or data.get("evaluated_at") != pending["data"].get("evaluated_at")
+                    or data.get("completed") is not True or data.get("cancelled") is not False
+                    or data.get("error") is not None or snapshot is None):
+                raise ValueError("Calendar processing is incomplete, interrupted, or lacks its snapshot")
+            snap = snapshot["data"]
+            if (any(key not in snap for key in (
+                    "evaluated_at", "active_event", "pre_calendar_preset", "current", "smart_start", "modes"))
+                    or snap.get("evaluated_at") != data.get("evaluated_at")
+                    or snap.get("active_event") is not (state["active_event_token"] is not None)
+                    or any(snap.get(key) != state[key] for key in (
+                        "pre_calendar_preset", "current", "smart_start", "modes"))):
+                raise ValueError("Calendar processing snapshot diverged from boundary state")
+            results.append({"start": pending, "snapshot": snapshot, "end": rec})
+            previous = state
+            pending, snapshot = None, None
+            next_step += 1
+    if pending is not None:
+        raise ValueError("Calendar recording ends with incomplete processing")
     return results
 
 

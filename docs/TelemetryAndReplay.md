@@ -32,7 +32,7 @@ Record envelope: `{"v":1,"seq":N,"wall":..,"mono":..,"zone":"..","kind":"..","da
 | `valve` | `ZoneSyncManager.async_sync_proportional_valves` | zone name | demand, mode and HA-observed state, prior command, target, action, command outcome and call/valve replay boundaries |
 | `sensor` | climate, window, coordinator and OpenTherm diagnostics | entity id or null | initial/change observations for configured inputs and sampled OpenTherm diagnostic sources, plus external-temperature, TRV, window and zone-climate events |
 | `config` | coordinator startup/settings, schedule manager and entry update listener | null | allowlisted control settings, zone and schedule snapshots and setting changes |
-| `event` | free-form | any | schedule evaluation and manual overrides, hysteresis, zone mode resolution/changes, DHW freeze, weather compensation, frost, anti-seize, relay emergency-off and delayed relay task phases |
+| `event` | free-form | any | schedule evaluation and manual overrides, hysteresis, zone mode resolution/changes, DHW freeze, weather compensation, frost, anti-seize, relay emergency-off and delayed relay task phases, OpenTherm update boundaries |
 
 New `pwm`/`boiler` records capture selected engine state *before* the call and the exact
 monotonic clock value read by the PWM calculation. Older records lack `calculation_time`; using
@@ -54,24 +54,38 @@ HA entity states, OpenTherm `inferred_on` and switch states are not independent 
 firing, valve position or water flow.
 
 Sensor records cover the integration's external-temperature, TRV, window and virtual climate event
-handlers, plus initial and change observations for configured zone, boiler, weather and presence
-entities. They include selected control-relevant scalar attributes, not arbitrary HA attributes or
+handlers, plus initial and change observations for configured zone, boiler, weather, presence and
+calibration entities. A per-coordinator manifest, initialization boundary and incrementing step
+make missing interior observations detectable. Changes include old and new selected state,
+HA `last_changed`/`last_updated` and event time when supplied. They include selected
+control-relevant attributes (including HVAC/preset mode lists), not arbitrary HA attributes or
 every dynamically discovered diagnostic sensor. OpenTherm diagnostic records also capture the
 companion entity values read by each diagnostic evaluation and the resulting DHW/flame/fault state.
-Numeric/boolean persistent settings and selected
-control strings are logged; complex values and entry contents are not logged, to avoid indiscriminate
-capture of unrelated configuration data. Entry updates include allowlisted control values and key
-names. Startup records include selected core control fields, allowlisted zone configuration and
-persisted scalar settings. Schedule startup/save records include profile definitions and overrides;
+Numeric/boolean persistent settings, selected control strings and zone-mode maps are logged;
+other complex values are marked as unrecorded, to avoid indiscriminate capture of unrelated
+configuration data. Setting mutations are recorded when applied in memory, before the asynchronous
+save, followed by its success, failure or cancellation; a failed save does not undo the mutation.
+Synchronous zone-mode writes are captured separately from their subsequently scheduled saves.
+Runtime changes to master enable, boiler cycle/delay settings and derivative settings are recorded
+at the coordinator mutation, including restored number-entity values.
+Entry updates include allowlisted control values and key names. Startup records include selected
+core control fields, allowlisted effective entry configuration (including calibrations and presence),
+persisted settings and a preset/zone-mode/window-state checkpoint. Preset, zone-mode and window
+override mutations have a per-manager sequence. Schedule startup/save records include profile definitions and overrides;
 these can reveal household routines, so protect and handle telemetry files accordingly. This is not
 a complete configuration snapshot; settings written through other storage paths can still be missed.
+These records can contain occupancy-related entity IDs and schedule information; protect them.
 Weather inputs used by OpenTherm are recorded on calculation, not as a complete sensor event stream.
 Zone mode resolution records distinguish window, calendar and configured modes; frequent mode
 reads can generate many events. Zone-controller records identify DHW PID freezes/resets and
 capture the PID result and weather feed-forward inputs and output. Calendar processing records
 snapshot the resulting temperature, smart-start and mode overrides without recording calendar
-titles. Those snapshots can still reveal household routines. They do not reconstruct every
-calendar, presence or profile lifecycle.
+titles. Calendar processing also records start/end state, an instance epoch and a step even for
+failed or cancelled operations. Active-event identity is represented by a keyed token: it can
+link repeated events within one manager instance, but the key and title are not written to
+telemetry. These records and their timestamps can still reveal household routines; ordinary
+application logging may separately include event titles. They do not capture parsed calendar
+commands or all sensor/preset reads, and cannot reconstruct calendar decisions.
 Zone-control skip records distinguish missing or invalid temperatures, unregistered zones,
 critical sensor faults and inactive modes, and identify whether demand was actually updated.
 Schedule evaluations record before/after override state and the effective slot, upcoming blocks,
@@ -155,10 +169,12 @@ deterministic `ManualClock`.
   recorded wait, and executes the real task and relay command. The switch-path decision is
   independently replayed and supplied to the task. It also supports a final sequential update
   cancelling a task already waiting, when the cancellation and task completion are recorded after
-  that update. For a cancellation not caused by a replayed update, it injects cancellation into
+  that update. A final master-off action also replays through the real emergency-off path, including
+  supported service failures and cancellation, and a delayed task finishing while the off service
+  call is in progress. For a cancellation not caused by a replayed action, it injects cancellation into
   the waiting task and reports the source as `unknown`; it does not identify or reconstruct the
-  external action. It rejects overlapping task/update execution, multiple delay cycles and
-  incomplete traces; it does not reconstruct other plant actions, physical hardware or arbitrary
+  external action. Other overlapping task/update execution, multiple delay cycles and incomplete
+  traces are rejected; it does not reconstruct other plant actions, physical hardware or arbitrary
   asynchronous histories.
   `drivers.replay_sequential_waiting_plant_from_records(records)` applies that driver to consecutive,
   non-overlapping waiting cycles, checking backend and PWM continuity and task identities across
@@ -192,6 +208,22 @@ deterministic `ManualClock`.
   feed-forward calculation using captured PID output, effective target, outdoor temperature and
   effective weather multiplier. It does not replay the PID, thermal model, or their combined state;
   those are separately replayed where supported.
+* `history.reconstruct_configured_inputs(records)` reconstructs the recorded selected HA state
+  for each monitored entity from a complete manifest, initial snapshot and contiguous changes.
+  It validates prior-state continuity and rejects missing steps, incomplete initialization and
+  inconsistent old states. It reconstructs observations, not the callbacks or control calculations
+  they trigger. Missing tail events cannot be detected without a later event, and it cannot
+  recover changes before monitoring began or changes that HA never emitted.
+* `history.reconstruct_persistent_settings(records)` reconstructs recorded setting mutations
+  from startup checkpoints, including interleaved save results, errors and cancellation.
+  Unrecorded values remain explicitly unknown. It detects missing interior mutations and
+  save outcomes, but cannot infer other direct writes or omitted prefixes/tails.
+  `history.reconstruct_preset_history(records)` similarly applies preset, zone-mode and
+  window-state changes to their checkpoint; it does not replay service calls or scheduling.
+  `history.reconstruct_runtime_control_settings(records)` checks coordinator runtime master,
+  cycle, valve-delay and derivative changes against their startup checkpoint. It captures the
+  coordinator values, not proof that every downstream backend or PID accepted them.
+  These require the new checkpoint and sequence records; older recordings are unsupported.
 * `drivers.replay_schedule_evaluations_from_records(records)` re-runs individual evaluations
   using recorded effective slot, future-block, temperature and heating-rate inputs, including
   profile expiry, manual overrides, explicit-off zones and smart-return decisions from the
@@ -220,6 +252,12 @@ deterministic `ManualClock`.
   It rejects overlapping, interrupted, missing or otherwise externally modified histories.
   The first record in an epoch seeds state, so an absent prefix or tail cannot be detected
   without another recorded boundary.
+* `drivers.verify_calendar_override_lifecycle_from_records(records)` checks non-overlapping,
+  completed calendar-processing boundaries and their snapshots for contiguous steps and state
+  continuity. It rejects missing boundaries, interrupted operations and overlaps; older snapshots
+  without boundaries are unsupported. This is a consistency check, **not replay**: it cannot
+  establish that calendar overrides were calculated correctly or that external side effects
+  occurred, and it cannot identify an omitted prefix or suffix.
 * `drivers.replay_hysteresis_from_records(records)` re-runs the learning-phase hysteresis using
   the recorded previous demand and effective target; it does not replay autotuner learning.
   `drivers.replay_zone_control_skips_from_records(records)` reproduces recorded early-exit
@@ -248,6 +286,19 @@ deterministic `ManualClock`.
   update is independently seeded, not a reconstruction of overlapping concurrent updates;
   comparisons of returned reason, pending state and commands with the original remain the caller's
   responsibility. Old records without a trace cannot be used.
+  `drivers.replay_stateful_opentherm_from_records(records)` links non-overlapping updates using
+  their per-backend epoch, step and start/end boundaries, checks pending-command and reason
+  continuity, and compares each independently replayed result to the recorded outcome. It covers
+  unavailable entities and supported service errors and cancellations. Steps advance while
+  recording is off, exposing interior gaps; missing prefixes or tails cannot always be detected.
+  Non-overlapping emergency-off actions are replayed through the real emergency method and its
+  nested update, with before/after state and lifecycle checks, including supported service failures
+  and cancellation. `drivers.replay_linked_opentherm_plant_from_records(records)` links those
+  operations to separately replayed orchestrator decisions and checks their ordering and inputs;
+  it rejects unmatched actions and overlaps. Older recordings lack these boundaries. Updates without
+  an entity, external changes that leave no observable state
+  difference, and overlapping calls are not reconstructed; this is not a shared-backend replay
+  of the full OpenTherm plant.
 * `plant_orchestrated.replay_orchestrated_plant(events, zones, ...)` replays synthetic timed input
   events through real aggregation, orchestration, zone PWM and relay boiler code, with simulated
   switches and deterministic valve delays. This is not yet a full real-log plant replay: it does
