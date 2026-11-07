@@ -1,6 +1,58 @@
 # Changelog
 
 ## [Unreleased]
+### Fix: Overshoot anomaly after setpoint setbacks
+- Overshoot detection now requires the room temperature to cross above the 1.5°C limit while the
+  current target is active. A profile change or startup with a room already above that limit no
+  longer reports pre-existing warmth as an overshoot. Detection re-arms when the temperature is
+  at or below the limit; the existing recent-heating requirement remains.
+
+### Fix: Valve, boiler and zone synchronization
+- Valve switches are reconciled on every PWM tick, so unavailable devices and dropped commands can
+  be retried without waiting for a PWM state change. Switch and proportional-valve commands can
+  also recover devices reporting `unknown`; unavailable devices are skipped with a warning.
+- Relay-boiler shutdown is attempted unless the relay is already known to be off. Ignition is held
+  when all demanding switch-valve paths are closed or unknown, with frost and anti-seize exceptions;
+  the path is checked again after the configured valve-opening delay.
+- Switch-only zones report heating only while a valve switch is on. A periodic zone refresh
+  recalculates demand and updates the boiler without feeding unchanged readings into the autotuner
+  or thermal model; errors in one zone do not stop refreshes for the others.
+
+### Fix: PID derivative and autotuning
+- The PID derivative uses a windowed temperature slope with a configurable output limit instead
+  of a two-sample difference. New Master Control number entities adjust the derivative window
+  (default 15 minutes) and limit (default 15%); setting either to zero disables the derivative.
+- New autotune results cap `Kd` at 60 times `Kp`; previously stored gains are not rewritten.
+  Further PID and PWM defects remain under investigation; these changes do not resolve every
+  oscillation, minimum-cycle or valve/boiler synchronization issue.
+
+### Fix: Dashboard columns
+- Both bundled thermostat cards now respect the configured dashboard columns property.
+
+### Added: Telemetry and diagnostics
+- Records bounded JSONL telemetry for PID calculations, valve PWM, relay-boiler decisions,
+  switch synchronization and rate-estimator updates in `<config>/mzt_telemetry`. Records include
+  wall and monotonic timestamps. Logs rotate at approximately 50 MB per file, with seven-day and
+  150 MB total retention limits; `NaN`, `+Inf` and `-Inf` remain distinguishable on round-trip.
+- A Diagnostics options page controls telemetry file logging (on by default) and optional debug
+  sensors (off by default). Debug sensors expose the latest PID, estimator, valve-PWM and boiler
+  records; enabling them without file logging retains data only in memory.
+- Added offline JSONL summary and CSV export via `scripts/mzt_log.py`, with kind, zone and time
+  filters for CSV. See [TelemetryAndReplay.md](./docs/TelemetryAndReplay.md) for usage and
+  current instrumentation gaps.
+
+### Added: Replay, test coverage and deployment tooling
+- Added deterministic replay drivers for PID, PWM and rate estimators, synthetic room and sensor
+  scenarios, and a frozen PID reference for differential tests. PID record replay starts at a
+  clean-state boundary; dead-sensor records are skipped.
+- Added strict expected-failure tests for known PID, PWM, estimator, sync and simulated plant
+  defects. `pytest --show-red` runs these as ordinary failing tests. Simulated plant results are
+  not a substitute for real installation validation.
+- Added [DeploymentTestPlan.md](./DeploymentTestPlan.md) and a temporary read-only HA collector,
+  `scripts/mzt_capture.py`, for selected entity observations, markers, candidate alerts and
+  optional telemetry snapshots. It polls, can miss short transitions, and cannot establish
+  physical valve position or flow.
+
 ### Refactor: Pluggable heating/cooling rate estimators
 - New `rate_estimators.py` defines the estimator contract (`update(ts, temp, is_heating)`, `heating_rate`, `cooling_rate`, optional `dump_state`/`load_state`), a registry (`register_estimator`) and the original algorithm as `LegacyEmaEstimator`, which remains the default so behaviour is unchanged.
 - `ThermalObserver` now delegates rate learning to the selected estimator (inertia tracking and the weather multiplier are unchanged) and accepts an optional sample timestamp so history can be replayed. Select one with the `rate_estimator` config option.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 from homeassistant.core import HomeAssistant
@@ -20,6 +21,26 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _update_overshoot_tracking(state: dict[str, Any], target: Any, temperature: float | None) -> None:
+    """Arm only after observing a temperature at or below the current target's limit."""
+    try:
+        target_value = float(target)
+    except (TypeError, ValueError):
+        target_value = None
+    if target_value is not None and not math.isfinite(target_value):
+        target_value = None
+    if temperature is None or not math.isfinite(temperature) or target_value is None:
+        state["overshoot_target"] = None
+        state["overshoot_armed"] = False
+        return
+    if state.get("overshoot_target") != target_value:
+        state["overshoot_target"] = target_value
+        state["overshoot_armed"] = False
+    if temperature <= target_value + 1.5:
+        state["overshoot_armed"] = True
+
 
 def get_battery_level(hass: HomeAssistant, entity_id: str) -> int | None:
     """Find battery level for an entity (attributes, device registry, or related sensor)."""
@@ -272,6 +293,7 @@ def evaluate_zone_anomalies(
         now_mono = time.monotonic()
         st = hass.states.get(climate_id)
         if not st:
+            _update_overshoot_tracking(state, None, None)
             return ANOMALY_NONE, "Zone not ready"
 
         current_temp = st.attributes.get("current_temperature")
@@ -279,9 +301,15 @@ def evaluate_zone_anomalies(
         demand = coordinator.get_zone_demand(climate_id)
 
         if current_temp is None:
+            _update_overshoot_tracking(state, None, None)
             return ANOMALY_NONE, "Waiting for temperature reading"
 
-        current_temp = float(current_temp)
+        try:
+            current_temp = float(current_temp)
+        except (TypeError, ValueError):
+            _update_overshoot_tracking(state, None, None)
+            raise
+        _update_overshoot_tracking(state, target_temp, current_temp)
 
         # 0.a Battery Check (Main Sensor)
         zone = coordinator.zone_manager.get_zone(climate_id)
@@ -354,6 +382,7 @@ def evaluate_zone_anomalies(
         # If the zone is Bypassed, it is intentionally excluded from heating
         zone_mode = coordinator.get_zone_mode(climate_id)
         if zone_mode == "bypass":
+            _update_overshoot_tracking(state, None, None)
             state["active_anomaly"] = ANOMALY_NONE
             state["anomaly_details"] = "Zone bypassed (Excluded from heating)"
             return ANOMALY_NONE, state["anomaly_details"]
@@ -377,10 +406,10 @@ def evaluate_zone_anomalies(
         if boiler_on and demand > 0.0:
             state["last_heating_time"] = now_mono
 
-        # 2. Overshoot Check: Only if heating was active recently (within the last 2 ore)
-        # If the heating wasn't active recently, warm room temperature is natural ambient/solar heat.
+        # A setback can put the room above the new limit without any overshoot.
         heated_recently = state["last_heating_time"] is not None and (now_mono - state["last_heating_time"]) < 7200
-        if heated_recently and target_temp is not None and current_temp > (float(target_temp) + 1.5):
+        if (heated_recently and state["overshoot_armed"] and state["overshoot_target"] is not None
+                and current_temp > state["overshoot_target"] + 1.5):
             state["active_anomaly"] = ANOMALY_OVERSHOOT
             state["anomaly_details"] = f"Current temperature ({current_temp}°C) exceeds target ({target_temp}°C) by >1.5°C from residual heat"
             return ANOMALY_OVERSHOOT, state["anomaly_details"]
