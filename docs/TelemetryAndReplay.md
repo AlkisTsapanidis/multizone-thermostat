@@ -26,6 +26,9 @@ Record envelope: `{"v":1,"seq":N,"wall":..,"mono":..,"zone":"..","kind":"..","da
 | `boiler` | `RelayBoilerBackend.async_update` | `boiler` | same PWM fields **plus** `switch_state`, `pending_command`, `since_last_change`, `reason`, `reason_before` |
 | `sync` | `ZoneSyncManager.async_sync_switches` | zone name | `switch`, `desired`, `observed`, `action` (`turn_on`/`turn_off`/`skipped_unavailable`); in-sync ticks are not logged |
 | `estimator` | `ThermalObserver.update` | zone id | `ts`, `temp`, `is_heating`, `outdoor_temp`, `estimator`, `heating_rate`, `cooling_rate` |
+| `plant` | `PlantOrchestrator` | `boiler` | `action` (`aggregate`, `master_off`, `anti_seize`), pre-suppression `raw_demands`, `suppressed` reasons, DHW/frost flags, aggregate demand, strategy and primary/secondary results when aggregation runs |
+| `opentherm` | `OpenThermBoilerBackend.async_update` | `boiler` | demand, target and bounds, weather inputs/offset, HA state, `inferred_on`, pending command, `update_completed`, `command_error`; unavailable updates have a reduced record |
+| `valve` | `ZoneSyncManager.async_sync_proportional_valves` | zone name | target, HA-observed state, previous command, scale, mode, action, `command_completed` and `command_error` for command paths |
 | `event` | free-form | any | currently `hysteresis_demand` (autotune learning phase) |
 
 `pwm`/`boiler` records carry the engine state *before* the call, so a replay can be exact from any
@@ -33,8 +36,30 @@ starting record.
 
 Instrumentation wraps or follows existing calls; it does not change control flow or values.
 
-Not yet instrumented (next): `OpenThermBoilerBackend`, proportional valves, `DemandAggregator`,
-frost/anti-seize, DHW override, raw sensor events, config/option changes.
+`raw_demands` can be null if the snapshot is unavailable; aggregate maps describe the output,
+not every mode or weight used to calculate it. Override records do not capture all frost or
+anti-seize internals. `update_completed` means the OpenTherm update returned from its service
+calls, not that a particular command was sent or physically enacted. `command_completed` means
+the proportional-valve service call returned, not that the valve moved. A false completion with
+no error can indicate cancellation; unsupported valve domains are identified separately.
+HA entity states, OpenTherm `inferred_on` and switch states are not independent proof of burner
+firing, valve position or water flow.
+
+Still missing: raw sensor events, configuration changes, effective aggregation modes and weights,
+complete override inputs and transitions, independent actuator/flow feedback, and complete plant
+and OpenTherm replay. Direct estimator replay from telemetry records also remains to be implemented.
+
+### ASHRAE-inspired test mapping
+
+The tests in `tests/test_ashrae_plant_observability.py` cite ASHRAE Guideline 36-2018
+Addendum y sections where relevant. They adapt §5.21.2 (plant decisions), §5.21.4 (supply
+temperature control), §4.11 and §5.21.10 (command/feedback), and §5.21.11 (operating
+states and faults) to this domestic system. Delayed relay tests also exercise path and request
+rechecks and cancellation under §4.11 and §5.21.2.4, without simulating a complete plant.
+MZT does not implement the guideline's full central
+plant sequences, pump/flow proof or trim-and-respond reset. These are engineering tests, not
+guideline conformance or certification tests, and the guideline's timings and thresholds are
+not assumed to apply to this installation.
 
 ## 2. Replay (offline, `tests/mzt_replay`)
 

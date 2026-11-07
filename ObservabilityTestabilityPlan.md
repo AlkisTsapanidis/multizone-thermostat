@@ -15,13 +15,16 @@ For deployment checks and real-world data collection, see
 
 - [x] Bounded JSONL telemetry with wall and monotonic timestamps, retention, and lossless
   `NaN`/`+Inf`/`-Inf` handling. PID, valve PWM, relay boiler, switch sync and estimator
-  events are instrumented; this is **not** yet complete coverage of all control inputs and decisions.
+  events are instrumented, along with plant aggregation/overrides, OpenTherm updates and
+  proportional-valve decisions; this is **not** complete coverage of all control inputs and decisions.
 - [x] Offline CSV export and summary CLI; optional diagnostic sensor entities default to off.
 - [x] Synthetic scenarios and replay drivers for PWM, PID and estimators. PWM and PID
   telemetry round trips are tested using generated records; PID replay requires a clean-state
   boundary. A frozen PID reference supports differential tests.
 - [x] Known-defect tests for PID, PWM, estimators, switch sync and closed-loop valve/boiler
   scenarios; strict expected failures can be run as ordinary failing tests with `--show-red`.
+- [x] Added adapted ASHRAE Addendum y section-referenced tests for selected plant decisions,
+  OpenTherm mapping and proportional-valve command observation; these do not establish conformance.
 - [x] The existing GitHub Actions workflow runs the test suite. This records the configured
   CI step, not a claim that a particular remote run passed.
 - [ ] Complete instrumentation, replay and ground-truth coverage for every numerical and
@@ -742,8 +745,9 @@ def export_as_csv(zone_id: str, output_file: str):
 - [x] Integrate the recorder lifecycle with the Home Assistant coordinator
 - [ ] Test on real system; capture 24+ hours of logs
 
-**Partial:** OpenTherm, proportional valves, demand aggregation, frost/anti-seize, DHW,
-raw sensor events and configuration changes still need instrumentation.
+**Partial:** Plant aggregation, OpenTherm, proportional valves and override decisions now emit
+records, but effective aggregation modes/weights, complete frost/anti-seize internals, raw sensor
+events, configuration changes and independent physical feedback still need instrumentation.
 **Deliverable outstanding:** First verified real log file with control decisions.
 
 ### Week 2: Replay Engine & Export

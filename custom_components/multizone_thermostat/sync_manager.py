@@ -350,6 +350,12 @@ class ZoneSyncManager:
             st = self.hass.states.get(valve_entity)
             if not st or st.state == STATE_UNAVAILABLE:
                 _LOGGER.warning("Zone %s: valve %s is unavailable, command skipped", self._zone_name, valve_entity)
+                telemetry.get_recorder().record(
+                    telemetry.KIND_VALVE, self._zone_name, entity=valve_entity,
+                    target_pct=target_pct, observed=getattr(st, "state", None),
+                    action="skipped_unavailable", master_off=master_hvac_mode == HVACMode.OFF,
+                    zone_mode=zone_mode,
+                )
                 continue
             target_val = round(target_pct / 10.0, 1) if self._valve_scale == VALVE_SCALE_VOLT else round(target_pct, 1)
             last_val = self._last_valve_positions.get(valve_entity)
@@ -358,9 +364,17 @@ class ZoneSyncManager:
             if last_val is not None:
                 threshold = 0.05 if self._valve_scale == VALVE_SCALE_VOLT else 0.5
                 if abs(target_val - last_val) < threshold and target_val not in (0.0, 100.0, 10.0):
+                    telemetry.get_recorder().record(
+                        telemetry.KIND_VALVE, self._zone_name, entity=valve_entity, target_pct=target_pct,
+                        target_value=target_val, previous_command=last_val, observed=st.state,
+                        action="deadband", scale=self._valve_scale, zone_mode=zone_mode,
+                    )
                     continue
 
             domain = valve_entity.split(".", 1)[0]
+            command_error = None
+            command_completed = False
+            supported_domain = domain in ("valve", "number", "input_number")
             try:
                 if domain == "valve":
                     await self.hass.services.async_call(
@@ -376,9 +390,19 @@ class ZoneSyncManager:
                         {ATTR_ENTITY_ID: valve_entity, "value": target_val},
                         context=self._internal_context,
                     )
+                command_completed = supported_domain
                 self._last_valve_positions[valve_entity] = target_val
             except Exception as err:
+                command_error = str(err)
                 _LOGGER.error("Failed to set proportional valve position for %s: %s", valve_entity, err)
+            finally:
+                telemetry.get_recorder().record(
+                    telemetry.KIND_VALVE, self._zone_name, entity=valve_entity, target_pct=target_pct,
+                    target_value=target_val, previous_command=last_val, observed=st.state,
+                    action="command_attempt" if supported_domain else "unsupported_domain",
+                    scale=self._valve_scale, zone_mode=zone_mode, command_error=command_error,
+                    command_completed=command_completed,
+                )
 
 
     async def process_trv_change(

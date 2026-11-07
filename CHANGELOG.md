@@ -34,6 +34,8 @@
   switch synchronization and rate-estimator updates in `<config>/mzt_telemetry`. Records include
   wall and monotonic timestamps. Logs rotate at approximately 50 MB per file, with seven-day and
   150 MB total retention limits; `NaN`, `+Inf` and `-Inf` remain distinguishable on round-trip.
+- Adds plant aggregation/override, OpenTherm target/update and proportional-valve decision records.
+  Reported HA states and completed service calls are not proof of physical actuation or flow.
 - A Diagnostics options page controls telemetry file logging (on by default) and optional debug
   sensors (off by default). Debug sensors expose the latest PID, estimator, valve-PWM and boiler
   records; enabling them without file logging retains data only in memory.
@@ -48,6 +50,8 @@
 - Added strict expected-failure tests for known PID, PWM, estimator, sync and simulated plant
   defects. `pytest --show-red` runs these as ordinary failing tests. Simulated plant results are
   not a substitute for real installation validation.
+- Added selected plant, OpenTherm and valve observation tests inspired by cited sections of ASHRAE
+  Guideline 36-2018 Addendum y; these adaptations are not guideline conformance tests.
 - Added [DeploymentTestPlan.md](./DeploymentTestPlan.md) and a temporary read-only HA collector,
   `scripts/mzt_capture.py`, for selected entity observations, markers, candidate alerts and
   optional telemetry snapshots. It polls, can miss short transitions, and cannot establish

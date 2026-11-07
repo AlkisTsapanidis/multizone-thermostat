@@ -37,6 +37,9 @@ KIND_PWM = "pwm"                # PWMEngine.calculate() input, timings, state
 KIND_ESTIMATOR = "estimator"    # rate estimator update inputs and resulting rates
 KIND_SYNC = "sync"              # desired vs commanded vs observed switch state
 KIND_BOILER = "boiler"          # boiler backend decision and reason
+KIND_PLANT = "plant"            # plant orchestration and aggregated demand
+KIND_OPENTHERM = "opentherm"    # OpenTherm target and command outcome
+KIND_VALVE = "valve"            # proportional valve decisions and command outcome
 KIND_EVENT = "event"            # free-form notable event (anomaly, restart, config change)
 
 

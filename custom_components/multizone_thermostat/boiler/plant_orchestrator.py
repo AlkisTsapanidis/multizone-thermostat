@@ -4,6 +4,7 @@ import inspect
 import logging
 
 from ..const import CONF_ZONE_NAME, make_zone_entity_id
+from .. import telemetry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +21,9 @@ class PlantOrchestrator:
         """Periodic PWM tick for boiler."""
         try:
             if hasattr(self.coordinator, "anti_seize_manager") and self.coordinator.anti_seize_manager.is_running:
+                telemetry.get_recorder().record(
+                    telemetry.KIND_PLANT, "boiler", action="anti_seize", aggregation_evaluated=False,
+                )
                 return
                 
             await self._async_update_boiler()
@@ -48,9 +52,25 @@ class PlantOrchestrator:
 
         # Hard stop if master switch is OFF
         if not self.coordinator.get_master_state() and not frost_emergency:
+            telemetry.get_recorder().record(
+                telemetry.KIND_PLANT, "boiler", action="master_off", frost_emergency=False,
+                aggregation_evaluated=False,
+            )
             await self.boiler_backend.async_emergency_off()
             return
 
+        recorder = telemetry.get_recorder()
+        raw_demands = None
+        if recorder.enabled:
+            try:
+                get_demands = getattr(self.demand_aggregator, "get_all_demands", None)
+                if callable(get_demands):
+                    demands = get_demands()
+                    if isinstance(demands, dict):
+                        raw_demands = demands.copy()
+            except Exception:
+                _LOGGER.exception("Unable to capture pre-suppression plant demands")
+        suppressed = {}
         plant_diag = getattr(self.coordinator, "plant_diagnostics", None)
         zones = getattr(self.coordinator, "zones", None)
         if plant_diag and isinstance(zones, list):
@@ -62,17 +82,20 @@ class PlantOrchestrator:
                         plant_diag.evaluate_zone_anomalies(cid)
                     if not frost_emergency and hasattr(plant_diag, "has_critical_sensor_fault"):
                         if plant_diag.has_critical_sensor_fault(cid) is True:
+                            suppressed[cid] = "critical_sensor_fault"
                             self.demand_aggregator.set_zone_demand(cid, 0.0)
 
         if not frost_emergency and isinstance(climate_entities, dict):
             for climate_id, ent in list(climate_entities.items()):
                 if getattr(ent, "current_temperature", False) is None:
+                    suppressed[climate_id] = "missing_temperature"
                     self.demand_aggregator.set_zone_demand(climate_id, 0.0)
                 elif (
                     plant_diag
                     and hasattr(plant_diag, "has_critical_sensor_fault")
                     and plant_diag.has_critical_sensor_fault(climate_id) is True
                 ):
+                    suppressed[climate_id] = "critical_sensor_fault"
                     self.demand_aggregator.set_zone_demand(climate_id, 0.0)
 
         dhw_active = getattr(self.coordinator, "is_dhw_active", False)
@@ -80,5 +103,23 @@ class PlantOrchestrator:
             is_dhw_active=dhw_active,
             frost_emergency=frost_emergency,
         )
+        if recorder.enabled:
+            try:
+                primary = getattr(agg, "primary_demands", None)
+                secondary = getattr(agg, "secondary_demands", None)
+                recorder.record(
+                    telemetry.KIND_PLANT, "boiler", action="aggregate", aggregation_evaluated=True,
+                    raw_demands=raw_demands, suppressed=suppressed,
+                    frost_emergency=frost_emergency, dhw_active=dhw_active,
+                    demand=agg.demand, peak_zone=agg.peak_zone, strategy=getattr(agg, "strategy", None),
+                    primary_demands=primary.copy() if isinstance(primary, dict) else None,
+                    secondary_demands=secondary.copy() if isinstance(secondary, dict) else None,
+                    active_primary_count=getattr(agg, "active_primary_count", None),
+                    active_secondary_count=getattr(agg, "active_secondary_count", None),
+                    result_frost_emergency=getattr(agg, "frost_emergency", None),
+                    result_dhw_active=getattr(agg, "dhw_active", None),
+                )
+            except Exception:
+                _LOGGER.exception("Unable to capture plant aggregation telemetry")
                 
         await self.boiler_backend.async_update(agg.demand, agg.peak_zone, frost_emergency)

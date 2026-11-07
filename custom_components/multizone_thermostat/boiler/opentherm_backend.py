@@ -4,6 +4,7 @@ import time
 
 from homeassistant.core import HomeAssistant
 from .base import BoilerBackend
+from .. import telemetry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +44,11 @@ class OpenThermBoilerBackend(BoilerBackend):
 
         st = self.hass.states.get(self.opentherm_entity)
         if st is None or st.state in ("unavailable", "unknown"):
+            telemetry.get_recorder().record(
+                telemetry.KIND_OPENTHERM, "boiler", action="unavailable", entity=self.opentherm_entity,
+                observed_state=st.state if st is not None else None, demand=demand,
+                peak_zone=peak_zone, frost_emergency=frost_emergency,
+            )
             _LOGGER.debug("OpenTherm entity %s is not available yet, skipping update", self.opentherm_entity)
             return
 
@@ -51,6 +57,10 @@ class OpenThermBoilerBackend(BoilerBackend):
         wanted_on = norm_demand > 0.0
 
         target_temp = self.opentherm_min_temp + (norm_demand * (self.opentherm_max_temp - self.opentherm_min_temp))
+        outdoor_temp = None
+        curve_val = None
+        retention_factor = None
+        weather_flow_offset = 0.0
 
         if norm_demand > 0.0 and not frost_emergency:
             weather_sensor_id = getattr(self.coordinator, "weather_sensor_id", None)
@@ -155,6 +165,8 @@ class OpenThermBoilerBackend(BoilerBackend):
         elif self._status_reason != "OFF - Emergency/Master OFF":
             self._status_reason = "OFF - No Demand"
 
+        command_error = None
+        update_completed = False
         try:
             st = self.hass.states.get(self.opentherm_entity)
             if domain in ["climate", "water_heater"]:
@@ -225,8 +237,21 @@ class OpenThermBoilerBackend(BoilerBackend):
                     )
 
             await self._async_set_ch_enabled(norm_demand > 0.0)
+            update_completed = True
         except Exception as err:
+            command_error = str(err)
             _LOGGER.error("Failed to update OpenTherm entity %s: %s", self.opentherm_entity, err)
+        finally:
+            telemetry.get_recorder().record(
+                telemetry.KIND_OPENTHERM, "boiler", action="update", entity=self.opentherm_entity,
+                demand=demand, normalized_demand=norm_demand, peak_zone=peak_zone,
+                frost_emergency=frost_emergency, min_temp=self.opentherm_min_temp,
+                max_temp=self.opentherm_max_temp, target_temp=target_temp,
+                outdoor_temp=outdoor_temp, weather_curve=curve_val, retention_factor=retention_factor,
+                weather_flow_offset=weather_flow_offset, observed_state=st.state if st is not None else None,
+                inferred_on=confirmed_on, pending_command=self._pending_command,
+                reason=self._status_reason, command_error=command_error, update_completed=update_completed,
+            )
 
     async def _async_set_ch_enabled(self, enabled: bool) -> None:
         """Drive the optional CH-enable switch (true OFF), only when its state differs."""
