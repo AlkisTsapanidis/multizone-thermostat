@@ -40,6 +40,8 @@ KIND_BOILER = "boiler"          # boiler backend decision and reason
 KIND_PLANT = "plant"            # plant orchestration and aggregated demand
 KIND_OPENTHERM = "opentherm"    # OpenTherm target and command outcome
 KIND_VALVE = "valve"            # proportional valve decisions and command outcome
+KIND_AGGREGATION = "aggregation"  # effective zone inputs to demand aggregation
+KIND_CONFIG = "config"          # control setting changes
 KIND_EVENT = "event"            # free-form notable event (anomaly, restart, config change)
 
 

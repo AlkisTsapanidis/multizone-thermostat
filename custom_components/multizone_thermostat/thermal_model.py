@@ -1,6 +1,8 @@
 """Advanced Room Thermal Model (SAT) module."""
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from . import telemetry
 from .rate_estimators import (
@@ -42,6 +44,7 @@ class ThermalObserver:
             self.estimator = estimator
             self.estimator_name = getattr(estimator, "name", type(estimator).__name__)
 
+        self._reset_replay_epoch(isinstance(estimator, str) or estimator is None)
         # State tracking
         self._seen_sample = False
         self._is_heating = False
@@ -67,6 +70,13 @@ class ThermalObserver:
             return
         self._select_estimator(name)
         self._seen_sample = False
+        self._reset_replay_epoch(True)
+
+    def _reset_replay_epoch(self, fresh: bool) -> None:
+        self._replay_epoch = uuid4().hex
+        self._replay_step = 0
+        self._replay_fresh = fresh
+        self._replay_seed = None
 
     @property
     def heating_rate(self) -> float:
@@ -76,6 +86,7 @@ class ThermalObserver:
     @heating_rate.setter
     def heating_rate(self, value: float) -> None:
         self.estimator.heating_rate = value
+        self._reset_replay_epoch(False)
 
     @property
     def cooling_rate(self) -> float:
@@ -85,6 +96,7 @@ class ThermalObserver:
     @cooling_rate.setter
     def cooling_rate(self, value: float) -> None:
         self.estimator.cooling_rate = value
+        self._reset_replay_epoch(False)
 
     def update(self, current_temp: float, is_heating: bool, timestamp: datetime | None = None,
                outdoor_temp: float | None = None):
@@ -106,7 +118,11 @@ class ThermalObserver:
             telemetry.KIND_ESTIMATOR, self.zone_id, ts=now, temp=current_temp, is_heating=is_heating,
             outdoor_temp=outdoor_temp, estimator=self.estimator_name,
             heating_rate=self.estimator.heating_rate, cooling_rate=self.estimator.cooling_rate,
+            estimator_type=type(self.estimator).__name__, temp_delta_threshold=self.temp_delta_threshold,
+            replay_epoch=self._replay_epoch, replay_step=self._replay_step,
+            replay_fresh=self._replay_fresh, replay_seed=self._replay_seed,
         )
+        self._replay_step += 1
         if not self._seen_sample:
             self._seen_sample = True
             self._is_heating = is_heating
@@ -166,9 +182,20 @@ class ThermalObserver:
             _LOGGER.info("[%s] Stored rates came from estimator %r, now using %r; relearning rates",
                          self.zone_id, state.get("estimator", "legacy"), self.estimator_name)
             return
+        replayable_restore = self._replay_fresh and self._replay_step == 0
         self.heating_rate = state.get("heating_rate", 0.0)
         self.cooling_rate = state.get("cooling_rate", 0.0)
         load_estimator_state(self.estimator, state.get("estimator_state") or {})
+        self._reset_replay_epoch(False)
+        if replayable_restore:
+            try:
+                self._replay_seed = deepcopy({
+                    "heating_rate": self.heating_rate, "cooling_rate": self.cooling_rate,
+                    "estimator_state": state.get("estimator_state") or {},
+                })
+                self._replay_fresh = True
+            except Exception:
+                _LOGGER.exception("Unable to capture estimator replay seed for %s", self.zone_id)
 
     def get_weather_multiplier(self, manual_base_curve: float = 0.0) -> float:
         """

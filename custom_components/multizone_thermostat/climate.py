@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from datetime import timedelta
 import logging
 import time
@@ -329,6 +330,11 @@ class MultizoneVirtualThermostat(RestoreEntity, ClimateEntity):
     def _on_temp_changed(self, event: Event) -> None:
         """Handle external temperature sensor changes."""
         new_state: State | None = event.data.get("new_state")
+        from . import telemetry
+        telemetry.get_recorder().record(
+            telemetry.KIND_SENSOR, self.entity_id, source="external_temperature",
+            entity=self._temp_sensor, state=new_state.state if new_state is not None else None,
+        )
         if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             # Sensore non valido: valuta subito il fallback sui TRV senza
             # attendere il prossimo aggiornamento periodico.
@@ -401,6 +407,15 @@ class MultizoneVirtualThermostat(RestoreEntity, ClimateEntity):
     @callback
     def _on_trv_changed_wrapper(self, event: Event) -> None:
         """Wrapper for TRV changes."""
+        from . import telemetry
+        observed_state = event.data.get("new_state")
+        observed_attrs = getattr(observed_state, "attributes", None)
+        telemetry.get_recorder().record(
+            telemetry.KIND_SENSOR, self.entity_id, source="trv",
+            entity=event.data.get("entity_id"),
+            state=getattr(observed_state, "state", None),
+            temperature=observed_attrs.get("current_temperature") if isinstance(observed_attrs, Mapping) else None,
+        )
         if not self._temp_sensor or self._safety_fallback_active:
             new_state: State | None = event.data.get("new_state")
             old_state: State | None = event.data.get("old_state")
@@ -486,4 +501,3 @@ class MultizoneVirtualThermostat(RestoreEntity, ClimateEntity):
     async def _async_valve_tick(self, now: Any) -> None:
         """Evaluate and synchronize proportional valves."""
         await self._sync_manager.async_sync_proportional_valves(self._hvac_mode)
-

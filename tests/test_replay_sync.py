@@ -1,5 +1,8 @@
 """Closed-loop switch/valve reconciliation against fault-injecting fake switches."""
 from unittest.mock import MagicMock
+from types import SimpleNamespace
+from copy import deepcopy
+import asyncio
 
 import pytest
 
@@ -119,6 +122,187 @@ async def test_production_telemetry_round_trips_through_replay(tmp_path):
 
 
 # ---- known defects --------------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_real_log_pwm_replay_preserves_calculation_time_at_boundary(tmp_path):
+    """A delayed record timestamp must not change the recorded PWM decision."""
+    from custom_components.multizone_thermostat import pwm_engine, telemetry
+    from tests.mzt_replay.clock import ManualClock, patched_time
+    from tests.mzt_replay.drivers import replay_pwm_from_records
+
+    clock = ManualClock(start=449.9)
+    hass = FakeSwitches("switch.v1")
+    recorder = telemetry.JsonlRecorder(str(tmp_path), mono_clock=lambda: clock.now + 1)
+    telemetry.set_recorder(recorder)
+    try:
+        with patched_time(pwm_engine, clock):
+            manager, _ = make_manager(hass, demand=50)
+            manager._local_pwm.cycle_start_time = 0
+            manager._local_pwm._prev_demand = 50
+            await manager.async_pwm_tick(HVACMode.HEAT)
+        recorder.flush()
+    finally:
+        telemetry.set_recorder(None)
+    records = list(telemetry.read_records(str(p) for p in tmp_path.glob("*.jsonl")))
+    record, replayed = replay_pwm_from_records(records, zone="Zone", require_calculation_time=True)[0]
+    assert record["data"]["calculation_time"] == 449.9
+    assert record["mono"] == 450.9
+    assert record["data"]["state"] is True
+    assert replayed == record["data"]["state"]
+    record["data"].pop("calculation_time")
+    with pytest.raises(ValueError, match="lacks the calculation time"):
+        replay_pwm_from_records(records, zone="Zone", require_calculation_time=True)
+    assert replay_pwm_from_records(records, zone="Zone")[0][1] is False
+
+
+@pytest.mark.asyncio
+async def test_relay_boiler_replay_uses_pwm_calculation_time(tmp_path):
+    """The boiler record retains the engine clock read even when the record is timestamped later."""
+    from custom_components.multizone_thermostat import pwm_engine, telemetry
+    from custom_components.multizone_thermostat.boiler import relay_backend
+    from tests.mzt_replay.clock import ManualClock, patched_time
+    from tests.mzt_replay.drivers import replay_pwm_from_records, replay_stateful_pwm_from_records
+
+    clock = ManualClock(start=449.9)
+    hass = FakeSwitches("switch.boiler")
+    hass.state["switch.boiler"] = "on"
+    coordinator = SimpleNamespace(
+        zones=[], is_dhw_active=False, plant_diagnostics=SimpleNamespace(_current_boiler_start=1),
+        reset_last_active_time=lambda: None, record_diagnostic_event=lambda *_: None,
+    )
+    recorder = telemetry.JsonlRecorder(str(tmp_path), mono_clock=lambda: clock.now + 1)
+    telemetry.set_recorder(recorder)
+    try:
+        with patched_time(pwm_engine, clock), patched_time(relay_backend, clock):
+            backend = relay_backend.RelayBoilerBackend(hass, coordinator, "switch.boiler", 0, 0, 0)
+            backend._boiler_pwm.cycle_start_time = 0
+            backend._boiler_pwm._prev_demand = 50
+            backend._last_known_boiler_on = True
+            await backend.async_update(50, "Zone", False)
+        recorder.flush()
+    finally:
+        telemetry.set_recorder(None)
+    records = list(telemetry.read_records(str(p) for p in tmp_path.glob("*.jsonl")))
+    record, replayed = replay_pwm_from_records(records, zone="boiler", require_calculation_time=True)[0]
+    assert record["data"]["calculation_time"] == 449.9 and record["mono"] == 450.9
+    assert replayed is record["data"]["state"] is True
+    assert replay_stateful_pwm_from_records(records, "boiler", "boiler")[0][1] is True
+
+
+@pytest.mark.asyncio
+async def test_stateful_pwm_replay_detects_missing_and_divergent_steps(tmp_path):
+    """Recorded engine calls replay continuously and detect interior gaps."""
+    from custom_components.multizone_thermostat import pwm_engine, telemetry
+    from tests.mzt_replay.clock import ManualClock, patched_time
+    from tests.mzt_replay.drivers import replay_stateful_pwm_from_records
+
+    clock = ManualClock(start=100)
+    hass = FakeSwitches("switch.v1")
+    recorder = telemetry.JsonlRecorder(str(tmp_path), mono_clock=clock.monotonic)
+    telemetry.set_recorder(recorder)
+    try:
+        with patched_time(pwm_engine, clock):
+            manager, coord = make_manager(hass, demand=50)
+            for value in (100, 549, 551):
+                clock.set(value)
+                await manager.async_pwm_tick(HVACMode.HEAT)
+        recorder.flush()
+    finally:
+        telemetry.set_recorder(None)
+    records = list(telemetry.read_records(str(p) for p in tmp_path.glob("*.jsonl")))
+    pwm = [r for r in records if r["kind"] == "pwm"]
+    assert [state for _, state in replay_stateful_pwm_from_records(pwm, "Zone", "pwm")] == [True, True, False]
+    master_off = deepcopy(pwm[0])
+    master_off["data"].update(demand=None, state=False, master_off=True, calculation_time=None,
+                              pwm_epoch=None, pwm_step=None)
+    with_off = pwm[:1] + [master_off] + pwm[1:]
+    assert [state for _, state in replay_stateful_pwm_from_records(with_off, "Zone", "pwm")] == [
+        True, True, False,
+    ]
+    master_off["data"]["state"] = True
+    with pytest.raises(ValueError, match="lacks the demand input"):
+        replay_stateful_pwm_from_records(with_off, "Zone", "pwm")
+    with pytest.raises(ValueError, match="missing or duplicate step"):
+        replay_stateful_pwm_from_records(pwm[::2], "Zone", "pwm")
+    bad = deepcopy(pwm)
+    bad[1]["data"]["cycle_start_before"] = 10
+    with pytest.raises(ValueError, match="divergent previous state"):
+        replay_stateful_pwm_from_records(bad, "Zone", "pwm")
+    bad = deepcopy(pwm)
+    bad[1]["data"]["state"] = not bad[1]["data"]["state"]
+    with pytest.raises(ValueError, match="diverged"):
+        replay_stateful_pwm_from_records(bad, "Zone", "pwm")
+    for missing in ("absent", None):
+        bad = deepcopy(pwm)
+        if missing == "absent":
+            del bad[1]["data"]["demand"]
+        else:
+            bad[1]["data"]["demand"] = missing
+        with pytest.raises(ValueError, match="lacks the demand input"):
+            replay_stateful_pwm_from_records(bad, "Zone", "pwm")
+
+
+@pytest.mark.asyncio
+async def test_stateful_pwm_replay_accepts_actual_master_off_tick(tmp_path):
+    """Master-off records do not represent a PWM-engine calculation."""
+    from custom_components.multizone_thermostat import pwm_engine, telemetry
+    from tests.mzt_replay.clock import ManualClock, patched_time
+    from tests.mzt_replay.drivers import replay_stateful_pwm_from_records
+
+    clock = ManualClock(start=100)
+    recorder = telemetry.JsonlRecorder(str(tmp_path), mono_clock=clock.monotonic)
+    telemetry.set_recorder(recorder)
+    try:
+        with patched_time(pwm_engine, clock):
+            manager, _ = make_manager(FakeSwitches("switch.v1"), demand=50)
+            for mode in (HVACMode.HEAT, HVACMode.OFF, HVACMode.HEAT):
+                await manager.async_pwm_tick(mode)
+        recorder.flush()
+    finally:
+        telemetry.set_recorder(None)
+    rows = list(telemetry.read_records(str(p) for p in tmp_path.glob("*.jsonl")))
+    pwm = [row for row in rows if row["kind"] == "pwm"]
+    assert pwm[1]["data"]["master_off"] is True and pwm[1]["data"]["demand"] is None
+    assert len(replay_stateful_pwm_from_records(pwm, "Zone", "pwm")) == 2
+
+
+@pytest.mark.asyncio
+async def test_stateful_boiler_pwm_rejects_out_of_order_completed_updates(tmp_path):
+    """Overlapping boiler updates must not be mistaken for an ordered engine history."""
+    from custom_components.multizone_thermostat import telemetry
+    from custom_components.multizone_thermostat.boiler.relay_backend import RelayBoilerBackend
+    from tests.mzt_replay.drivers import replay_stateful_pwm_from_records
+
+    hass = FakeSwitches("switch.boiler")
+    coordinator = SimpleNamespace(
+        zones=[], is_dhw_active=False, plant_diagnostics=SimpleNamespace(_current_boiler_start=None),
+        get_zone_mode=lambda _: "primary", get_zone_demand=lambda _: 0,
+        record_diagnostic_event=lambda *_: None,
+    )
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        backend = RelayBoilerBackend(hass, coordinator, "switch.boiler", 0, 0, 0)
+        async def hold_on():
+            entered.set()
+            await release.wait()
+        backend._force_boiler_on = hold_on
+        first = asyncio.create_task(backend.async_update(100, "Zone", False))
+        await entered.wait()
+        await backend.async_update(0, None, False)
+        release.set()
+        await first
+        recorder.flush()
+    finally:
+        telemetry.set_recorder(None)
+    rows = list(telemetry.read_records(str(p) for p in tmp_path.glob("*.jsonl")))
+    boiler = [row for row in rows if row["kind"] == "boiler"]
+    assert [row["data"]["pwm_step"] for row in boiler] == [1, 0]
+    assert [row["data"]["calculation_state"] for row in boiler] == [False, True]
+    with pytest.raises(ValueError, match="missing or duplicate step"):
+        replay_stateful_pwm_from_records(boiler, "boiler", "boiler")
+
 
 @pytest.mark.known_defect("SYNC-001", "an exception commanding one switch aborts the loop: later switches are never commanded")
 @pytest.mark.asyncio

@@ -1,6 +1,8 @@
 """OpenTherm boiler backend."""
 import logging
 import time
+import asyncio
+from collections.abc import Mapping
 
 from homeassistant.core import HomeAssistant
 from .base import BoilerBackend
@@ -42,12 +44,64 @@ class OpenThermBoilerBackend(BoilerBackend):
         if not self.opentherm_entity:
             return
 
-        st = self.hass.states.get(self.opentherm_entity)
+        recorder = telemetry.get_recorder()
+        trace = [] if recorder.enabled else None
+        pending_before = self._pending_command
+        reason_before = self._status_reason
+
+        def read_state(entity):
+            state = self.hass.states.get(entity)
+            if trace is not None:
+                try:
+                    attrs = getattr(state, "attributes", None)
+                    trace.append({
+                        "type": "state", "entity": entity,
+                        "state": state.state if state is not None else None,
+                        "exists": state is not None,
+                        "domain": getattr(state, "domain", None),
+                        "attributes": {k: attrs[k] for k in ("temperature", "min") if k in attrs}
+                        if isinstance(attrs, Mapping) else {},
+                    })
+                except Exception:
+                    _LOGGER.exception("Unable to capture OpenTherm state for replay")
+                    trace.append({"type": "capture_error"})
+            return state
+
+        def monotonic():
+            value = time.monotonic()
+            if trace is not None:
+                trace.append({"type": "clock", "value": value})
+            return value
+
+        async def call_service(domain, service, data, **kwargs):
+            entry = {"type": "service", "domain": domain, "service": service,
+                     "data": data.copy(), "kwargs": kwargs.copy(),
+                     "outcome": "pending"} if trace is not None else None
+            if entry is not None:
+                trace.append(entry)
+            try:
+                result = await self.hass.services.async_call(domain, service, data, **kwargs)
+            except asyncio.CancelledError:
+                if entry is not None:
+                    entry["outcome"] = "cancelled"
+                raise
+            except Exception as err:
+                if entry is not None:
+                    entry["outcome"] = "error"
+                    entry["error"] = str(err)
+                raise
+            if entry is not None:
+                entry["outcome"] = "completed"
+            return result
+
+        st = read_state(self.opentherm_entity)
         if st is None or st.state in ("unavailable", "unknown"):
             telemetry.get_recorder().record(
                 telemetry.KIND_OPENTHERM, "boiler", action="unavailable", entity=self.opentherm_entity,
                 observed_state=st.state if st is not None else None, demand=demand,
                 peak_zone=peak_zone, frost_emergency=frost_emergency,
+                trace=trace, min_temp=self.opentherm_min_temp, max_temp=self.opentherm_max_temp,
+                ch_switch=self.ch_switch, pending_before=pending_before, reason_before=reason_before,
             )
             _LOGGER.debug("OpenTherm entity %s is not available yet, skipping update", self.opentherm_entity)
             return
@@ -61,6 +115,7 @@ class OpenThermBoilerBackend(BoilerBackend):
         curve_val = None
         retention_factor = None
         weather_flow_offset = 0.0
+        weather_cooling_rates = []
 
         if norm_demand > 0.0 and not frost_emergency:
             weather_sensor_id = getattr(self.coordinator, "weather_sensor_id", None)
@@ -71,7 +126,7 @@ class OpenThermBoilerBackend(BoilerBackend):
                 except (ValueError, TypeError):
                     curve_val = 0.0
                 if curve_val > 0.0:
-                    w_state = self.hass.states.get(weather_sensor_id)
+                    w_state = read_state(weather_sensor_id)
                     outdoor_temp = None
                     if w_state and getattr(w_state, "state", None) not in (None, "unavailable", "unknown"):
                         if getattr(w_state, "domain", None) == "weather" or str(weather_sensor_id).startswith("weather."):
@@ -92,6 +147,7 @@ class OpenThermBoilerBackend(BoilerBackend):
                                 cr = getattr(m, "cooling_rate", None)
                                 if isinstance(cr, (int, float)) and float(cr) > 0.05:
                                     valid_rates.append(float(cr))
+                        weather_cooling_rates = valid_rates
                         if valid_rates:
                             avg_cooling_rate = sum(valid_rates) / len(valid_rates)
                             retention_factor = min(1.5, max(0.8, 1.0 + (avg_cooling_rate - 0.2)))
@@ -104,6 +160,7 @@ class OpenThermBoilerBackend(BoilerBackend):
                         )
 
         target_temp = round(target_temp, 1)
+        computed_target_temp = target_temp
 
         domain = self.opentherm_entity.split(".")[0]
 
@@ -116,10 +173,10 @@ class OpenThermBoilerBackend(BoilerBackend):
         if ot_diag.get("flame_active") is not None:
             confirmed_on = bool(ot_diag["flame_active"])
         elif self.ch_switch:
-            sw_st = self.hass.states.get(self.ch_switch)
+            sw_st = read_state(self.ch_switch)
             confirmed_on = sw_st is not None and sw_st.state == "on"
         else:
-            st_check = self.hass.states.get(self.opentherm_entity)
+            st_check = read_state(self.opentherm_entity)
             if domain == "climate":
                 confirmed_on = st_check is not None and st_check.state == "heat"
             elif domain == "number":
@@ -146,7 +203,7 @@ class OpenThermBoilerBackend(BoilerBackend):
             cmd, ts = self._pending_command
             if (cmd == "on" and confirmed_on) or (cmd == "off" and not confirmed_on):
                 self._pending_command = None
-            elif time.monotonic() - ts > COMMAND_CONFIRM_TIMEOUT:
+            elif monotonic() - ts > COMMAND_CONFIRM_TIMEOUT:
                 _LOGGER.warning(
                     "OpenTherm entity %s did not confirm '%s' within %ss",
                     self.opentherm_entity,
@@ -168,11 +225,11 @@ class OpenThermBoilerBackend(BoilerBackend):
         command_error = None
         update_completed = False
         try:
-            st = self.hass.states.get(self.opentherm_entity)
+            st = read_state(self.opentherm_entity)
             if domain in ["climate", "water_heater"]:
                 current_target = st.attributes.get("temperature") if st else None
                 if current_target != target_temp:
-                    await self.hass.services.async_call(
+                    await call_service(
                         domain,
                         "set_temperature",
                         {"entity_id": self.opentherm_entity, "temperature": target_temp},
@@ -184,8 +241,8 @@ class OpenThermBoilerBackend(BoilerBackend):
                     hvac_mode = "off" if norm_demand <= 0.0 else "heat"
                     current_mode = st.state if st else None
                     if current_mode != hvac_mode:
-                        self._pending_command = ("off" if hvac_mode == "off" else "on", time.monotonic())
-                        await self.hass.services.async_call(
+                        self._pending_command = ("off" if hvac_mode == "off" else "on", monotonic())
+                        await call_service(
                             "climate",
                             "set_hvac_mode",
                             {"entity_id": self.opentherm_entity, "hvac_mode": hvac_mode},
@@ -194,16 +251,16 @@ class OpenThermBoilerBackend(BoilerBackend):
                 elif domain == "water_heater":
                     current_state = st.state if st else None
                     if norm_demand <= 0.0 and current_state not in ("off", None):
-                        self._pending_command = ("off", time.monotonic())
-                        await self.hass.services.async_call(
+                        self._pending_command = ("off", monotonic())
+                        await call_service(
                             "water_heater",
                             "turn_off",
                             {"entity_id": self.opentherm_entity},
                             blocking=False,
                         )
                     elif norm_demand > 0.0 and current_state == "off":
-                        self._pending_command = ("on", time.monotonic())
-                        await self.hass.services.async_call(
+                        self._pending_command = ("on", monotonic())
+                        await call_service(
                             "water_heater",
                             "turn_on",
                             {"entity_id": self.opentherm_entity},
@@ -228,15 +285,15 @@ class OpenThermBoilerBackend(BoilerBackend):
                     current_val = None
                 target_temp = value
                 if current_val != target_temp:
-                    self._pending_command = ("on" if heat_enabled else "off", time.monotonic())
-                    await self.hass.services.async_call(
+                    self._pending_command = ("on" if heat_enabled else "off", monotonic())
+                    await call_service(
                         "number",
                         "set_value",
                         {"entity_id": self.opentherm_entity, "value": target_temp},
                         blocking=False,
                     )
 
-            await self._async_set_ch_enabled(norm_demand > 0.0)
+            await self._async_set_ch_enabled(norm_demand > 0.0, read_state, call_service, monotonic)
             update_completed = True
         except Exception as err:
             command_error = str(err)
@@ -247,25 +304,32 @@ class OpenThermBoilerBackend(BoilerBackend):
                 demand=demand, normalized_demand=norm_demand, peak_zone=peak_zone,
                 frost_emergency=frost_emergency, min_temp=self.opentherm_min_temp,
                 max_temp=self.opentherm_max_temp, target_temp=target_temp,
+                computed_target_temp=computed_target_temp, weather_cooling_rates=weather_cooling_rates,
                 outdoor_temp=outdoor_temp, weather_curve=curve_val, retention_factor=retention_factor,
                 weather_flow_offset=weather_flow_offset, observed_state=st.state if st is not None else None,
                 inferred_on=confirmed_on, pending_command=self._pending_command,
                 reason=self._status_reason, command_error=command_error, update_completed=update_completed,
+                trace=trace, ch_switch=self.ch_switch, pending_before=pending_before,
+                reason_before=reason_before, flame_active=ot_diag.get("flame_active"),
+                weather_sensor_id=getattr(self.coordinator, "weather_sensor_id", None),
             )
 
-    async def _async_set_ch_enabled(self, enabled: bool) -> None:
+    async def _async_set_ch_enabled(self, enabled: bool, read_state=None, call_service=None, monotonic=None) -> None:
         """Drive the optional CH-enable switch (true OFF), only when its state differs."""
+        read_state = read_state or self.hass.states.get
+        call_service = call_service or self.hass.services.async_call
+        monotonic = monotonic or time.monotonic
         if not self.ch_switch:
             return
-        st = self.hass.states.get(self.ch_switch)
+        st = read_state(self.ch_switch)
         if st is None or st.state in ("unavailable", "unknown"):
             _LOGGER.debug("CH switch %s is not available yet, skipping command", self.ch_switch)
             return
         current_on = st.state == "on" if st else None
         if current_on == enabled:
             return
-        self._pending_command = ("on" if enabled else "off", time.monotonic())
-        await self.hass.services.async_call(
+        self._pending_command = ("on" if enabled else "off", monotonic())
+        await call_service(
             "switch",
             "turn_on" if enabled else "turn_off",
             {"entity_id": self.ch_switch},

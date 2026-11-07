@@ -4,6 +4,7 @@ The domestic plant's control contract differs from the central plant sequences i
 timings and thresholds here are MZT configuration values, not ASHRAE requirements.
 """
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -16,8 +17,13 @@ from custom_components.multizone_thermostat.boiler.opentherm_backend import Open
 from custom_components.multizone_thermostat.boiler.plant_orchestrator import PlantOrchestrator
 from custom_components.multizone_thermostat.boiler.relay_backend import RelayBoilerBackend
 from custom_components.multizone_thermostat.demand_aggregator import DemandAggregator
-from custom_components.multizone_thermostat.const import VALVE_SCALE_PERCENT, make_zone_entity_id
+from custom_components.multizone_thermostat.const import VALVE_SCALE_PERCENT, VALVE_SCALE_VOLT, make_zone_entity_id
 from custom_components.multizone_thermostat.sync_manager import ZoneSyncManager
+from tests.mzt_replay.drivers import (
+    replay_proportional_valves_from_records, replay_stateful_proportional_valves_from_records,
+    replay_relay_delay_checks_from_records, replay_relay_delay_cycles_from_records,
+    replay_relay_switch_paths_from_records,
+)
 
 
 @pytest.fixture
@@ -85,7 +91,9 @@ async def test_fault_suppression_and_master_off_are_not_confused_with_zero_deman
     assert rows[0]["raw_demands"][primary] == 40
     assert rows[0]["suppressed"] == {primary: "critical_sensor_fault"}
     assert rows[0]["demand"] == 0
-    assert rows[1] == {"action": "master_off", "frost_emergency": False, "aggregation_evaluated": False}
+    assert rows[1] == {
+        "action": "master_off", "frost_emergency": False, "master_on": False, "aggregation_evaluated": False,
+    }
     plant.boiler_backend.async_emergency_off.assert_awaited_once()
 
 
@@ -268,6 +276,172 @@ async def test_delayed_relay_task_cancellation_does_not_command():
     assert backend._pending_boiler_task is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frost,master,dhw,path,demand,expected", [
+    (True, False, True, "off", 0, True),
+    (False, False, False, "on", 50, False),
+    (False, True, True, "on", 50, False),
+    (False, True, False, "off", 50, False),
+    (False, True, False, "on", 50, True),
+    (False, True, False, "on", 0, False),
+])
+async def test_delayed_relay_recheck_record_replay(recorder, frost, master, dhw, path, demand, expected):
+    """§4.11 and §5.21.2.4: adapted delayed request rechecks, not flow proof."""
+    hass = MagicMock()
+    hass.async_create_task = asyncio.create_task
+    hass.states.get.return_value = SimpleNamespace(state=path)
+    coord = SimpleNamespace(
+        get_master_state=lambda: master, is_dhw_active=dhw,
+        zones=[{"name": "Room", "switch_entities": ["switch.valve"]}],
+        get_zone_mode=lambda _: "primary", get_zone_demand=lambda _: 50,
+    )
+    backend = RelayBoilerBackend(hass, coord, "switch.boiler", 0, 0, 0)
+    backend._last_frost_emergency = frost
+    backend._last_demand = demand
+    backend._force_boiler_on = AsyncMock()
+    backend._schedule_boiler_check(0, True)
+    await backend._pending_boiler_task
+    rows = records(recorder, telemetry.KIND_EVENT)
+    delay_phases = [row["data"]["phase"] for row in rows if row["data"]["event"] == "relay_delay"]
+    assert delay_phases == (["scheduled", "waiting", "expired", "rechecked", "on_request_started", "on_request_completed", "finished"]
+                            if expected else ["scheduled", "waiting", "expired", "rechecked", "finished"])
+    assert backend._force_boiler_on.await_count == int(expected)
+    telemetry.set_recorder(None)
+    replayed = replay_relay_delay_checks_from_records(rows)
+    assert replayed[0][1] is expected
+    cycles = await replay_relay_delay_cycles_from_records(rows)
+    assert cycles[0]["actions"] == (["on"] if expected else [])
+    assert cycles[0]["reason"] == backend.status_reason
+    with pytest.raises(ValueError, match="Incomplete relay delay"):
+        await replay_relay_delay_cycles_from_records(rows[:-1])
+    bad = deepcopy(rows)
+    check = next(row["data"] for row in bad if row["data"]["event"] == "relay_delay_check")
+    check["result"] = not expected
+    with pytest.raises(ValueError, match="diverged"):
+        replay_relay_delay_checks_from_records(bad)
+    missing = deepcopy(rows)
+    check = next(row["data"] for row in missing if row["data"]["event"] == "relay_delay_check")
+    del check["frost"]
+    with pytest.raises(ValueError, match="lacks inputs"):
+        replay_relay_delay_checks_from_records(missing)
+
+
+@pytest.mark.asyncio
+async def test_delayed_relay_lifecycle_records_cancellation(recorder):
+    """§5.21.2.4: adapted cancellation during delayed plant enable."""
+    hass = MagicMock()
+    hass.async_create_task = asyncio.create_task
+    backend = RelayBoilerBackend(hass, SimpleNamespace(), "switch.boiler", 0, 0, 60)
+    backend._force_boiler_on = AsyncMock()
+    backend._schedule_boiler_check(60, True)
+    task = backend._pending_boiler_task
+    await asyncio.sleep(0)
+    task.cancel()
+    await task
+    rows = records(recorder, telemetry.KIND_EVENT)
+    delay = [row["data"] for row in rows if row["data"]["event"] == "relay_delay"]
+    assert [row["phase"] for row in delay] == ["scheduled", "waiting", "cancelled", "finished"]
+    assert len({(row["epoch"], row["step"]) for row in delay}) == 1
+    backend._force_boiler_on.assert_not_awaited()
+    telemetry.set_recorder(None)
+    assert (await replay_relay_delay_cycles_from_records(rows))[0]["actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_delayed_relay_lifecycle_records_service_failure(recorder):
+    """§5.21.11: adapted delayed operation failure visibility."""
+    hass = MagicMock()
+    hass.async_create_task = asyncio.create_task
+    backend = RelayBoilerBackend(hass, SimpleNamespace(), "switch.boiler", 0, 0, 0)
+    backend._last_frost_emergency = True
+    backend._force_boiler_on = AsyncMock(side_effect=RuntimeError("relay failed"))
+    backend._schedule_boiler_check(0, True)
+    task = backend._pending_boiler_task
+    with pytest.raises(RuntimeError, match="relay failed"):
+        await task
+    rows = records(recorder, telemetry.KIND_EVENT)
+    delay = [row["data"] for row in rows
+             if row["data"]["event"] == "relay_delay"]
+    assert [row["phase"] for row in delay] == [
+        "scheduled", "waiting", "expired", "rechecked", "on_request_started", "error", "finished",
+    ]
+    assert delay[-2]["error"] == "relay failed"
+    telemetry.set_recorder(None)
+    assert (await replay_relay_delay_cycles_from_records(rows))[0]["actions"] == ["on"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_on", [True, False])
+async def test_delayed_relay_replays_cancellation_during_request(recorder, turn_on):
+    """§5.21.2.4: adapted cancellation during delayed command, not physical actuation."""
+    hass = MagicMock()
+    hass.async_create_task = asyncio.create_task
+    backend = RelayBoilerBackend(hass, SimpleNamespace(), "switch.boiler", 0, 0, 0)
+    backend._last_frost_emergency = True
+    backend._last_demand = 38
+    backend._force_boiler_on = AsyncMock(side_effect=asyncio.CancelledError)
+    backend._force_boiler_off = AsyncMock(side_effect=asyncio.CancelledError)
+    backend._schedule_boiler_check(0, turn_on)
+    await backend._pending_boiler_task
+    rows = records(recorder, telemetry.KIND_EVENT)
+    telemetry.set_recorder(None)
+    replayed = (await replay_relay_delay_cycles_from_records(rows))[0]
+    assert replayed["actions"] == (["on"] if turn_on else ["off"])
+    assert replayed["reason"] == backend.status_reason
+
+
+@pytest.mark.parametrize("states,expected", [
+    ({"switch.first": "off", "switch.second": "off"}, False),
+    ({"switch.first": "unavailable", "switch.second": "on"}, True),
+    ({"switch.first": "on", "switch.second": "off"}, True),
+    ({}, False),
+])
+def test_relay_switch_path_replays_observed_inputs(recorder, states, expected):
+    """§4.11 and §5.21.2.4: adapted switch-path inputs, not evidence of physical flow."""
+    hass = MagicMock()
+    hass.states.get.side_effect = lambda entity: (
+        SimpleNamespace(state=states[entity]) if entity in states else None
+    )
+    zones = [
+        {"name": "Secondary", "switch_entities": ["switch.ignored"]},
+        {"name": "Idle", "switch_entities": ["switch.ignored"]},
+        {"name": "Room", "switch_entities": ["switch.first", "switch.second"]},
+    ]
+    coord = SimpleNamespace(
+        zones=zones,
+        get_zone_mode=lambda cid: "secondary" if cid.endswith("_secondary") else "primary",
+        get_zone_demand=lambda cid: 0 if cid.endswith("_idle") else 70,
+    )
+    backend = RelayBoilerBackend(hass, coord, "switch.boiler", 0, 0, 0)
+    assert backend._switch_valve_path_open() is expected
+    rows = records(recorder, telemetry.KIND_EVENT)
+    telemetry.set_recorder(None)
+    assert replay_relay_switch_paths_from_records(rows)[0][1] is expected
+    changed = deepcopy(rows)
+    changed[0]["data"]["result"] = not expected
+    with pytest.raises(ValueError, match="diverged"):
+        replay_relay_switch_paths_from_records(changed)
+    missing = deepcopy(rows)
+    del missing[0]["data"]["zones"][-1]["demand"]
+    with pytest.raises(ValueError, match="lacks demand"):
+        replay_relay_switch_paths_from_records(missing)
+
+
+def test_relay_switch_path_replays_trv_only_and_empty_configuration(recorder):
+    """§4.11 and §5.21.2.4: adapted absence of a demanding switch-only path."""
+    coord = SimpleNamespace(
+        zones=[{"name": "Room", "climate_entities": ["climate.trv"], "switch_entities": ["switch.valve"]}],
+        get_zone_mode=lambda _: "primary", get_zone_demand=lambda _: 25,
+    )
+    backend = RelayBoilerBackend(MagicMock(), coord, "switch.boiler", 0, 0, 0)
+    assert backend._switch_valve_path_open() is None
+    coord.zones = []
+    assert backend._switch_valve_path_open() is None
+    rows = records(recorder, telemetry.KIND_EVENT)
+    telemetry.set_recorder(None)
+    assert [result for _, result in replay_relay_switch_paths_from_records(rows)] == [None, None]
+
+
 def make_valve(entity="number.test_valve"):
     hass = MagicMock()
     hass.services.async_call = AsyncMock()
@@ -328,3 +502,94 @@ async def test_cancelled_valve_command_is_not_reported_complete(recorder):
         await manager.async_sync_proportional_valves(HVACMode.HEAT)
     row = records(recorder, telemetry.KIND_VALVE)[0]["data"]
     assert not row["command_completed"] and row["command_error"] is None
+    assert row["command_cancelled"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity,scale", [
+    ("valve.test", VALVE_SCALE_PERCENT), ("number.test", VALVE_SCALE_VOLT),
+    ("input_number.test", VALVE_SCALE_PERCENT), ("sensor.test", VALVE_SCALE_PERCENT),
+])
+async def test_proportional_valve_replay_decisions_and_failures(recorder, entity, scale):
+    """§4.11 and §5.21.10.6-.7: adapted command replay, not actuator feedback."""
+    manager, coordinator, hass = make_valve(entity)
+    manager._valve_scale = scale
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    hass.states.get.return_value = None
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    hass.states.get.return_value = SimpleNamespace(state="unknown")
+    await manager.async_sync_proportional_valves(HVACMode.OFF)
+    coordinator.get_zone_mode = lambda _: "bypass"
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    coordinator.get_zone_mode = lambda _: "primary"
+    hass.services.async_call.side_effect = RuntimeError("service error")
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    if entity != "sensor.test":
+        hass.services.async_call.side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    rows = records(recorder, telemetry.KIND_VALVE)
+    telemetry.set_recorder(None)
+    replayed = await replay_proportional_valves_from_records(rows)
+    assert len(replayed) == len(rows)
+    assert replayed[0]["last_command"] == (6.5 if scale == VALVE_SCALE_VOLT else 65)
+    assert replayed[1]["commands"] == []
+    assert replayed[2]["commands"] == []
+    if entity != "sensor.test":
+        assert replayed[-1]["cancelled"]
+        assert replayed[-2]["record"]["data"]["command_error"] == "service error"
+    missing = deepcopy(rows)
+    del missing[0]["data"]["raw_demand"]
+    with pytest.raises(ValueError, match="lacks replay inputs"):
+        await replay_proportional_valves_from_records(missing)
+    divergent = deepcopy(rows)
+    divergent[0]["data"]["target_pct"] = 17
+    with pytest.raises(ValueError, match="diverged"):
+        await replay_proportional_valves_from_records(divergent)
+
+
+@pytest.mark.asyncio
+async def test_stateful_valve_replay_detects_dropped_and_divergent_decisions(recorder):
+    """§4.11 and §5.21.10.6-.7: adapted stateful command-history reconstruction."""
+    manager, coordinator, hass = make_valve()
+    manager._valves.append("valve.second")
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    coordinator.get_zone_demand = lambda _: 0
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    rows = records(recorder, telemetry.KIND_VALVE)
+    telemetry.set_recorder(None)
+    replayed = await replay_stateful_proportional_valves_from_records(rows)
+    assert [len(row["commands"]) for row in replayed] == [1, 1, 0, 0, 1, 1]
+    assert [row["last_command"] for row in replayed] == [65, 65, 65, 65, 0, 0]
+    with pytest.raises(ValueError, match="missing, duplicate or reordered"):
+        await replay_stateful_proportional_valves_from_records(rows[:2] + rows[4:])
+    with pytest.raises(ValueError, match="ordering"):
+        await replay_stateful_proportional_valves_from_records(rows[:1] + rows[2:])
+    with pytest.raises(ValueError, match="Incomplete valve call"):
+        await replay_stateful_proportional_valves_from_records(rows[:-1])
+    changed = deepcopy(rows)
+    changed[2]["data"]["previous_command"] = 40
+    with pytest.raises(ValueError, match="divergent previous command"):
+        await replay_stateful_proportional_valves_from_records(changed)
+    altered = deepcopy(rows)
+    altered[1]["data"]["raw_demand"] = 30
+    with pytest.raises(ValueError, match="divergent shared inputs"):
+        await replay_stateful_proportional_valves_from_records(altered)
+
+
+@pytest.mark.asyncio
+async def test_stateful_valve_replay_handles_mid_call_cancellation(recorder):
+    """§5.21.10.6-.7: adapted interruption and subsequent command state."""
+    manager, _, hass = make_valve()
+    manager._valves.append("valve.second")
+    hass.services.async_call.side_effect = [None, asyncio.CancelledError(), None, None]
+    with pytest.raises(asyncio.CancelledError):
+        await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    await manager.async_sync_proportional_valves(HVACMode.HEAT)
+    rows = records(recorder, telemetry.KIND_VALVE)
+    telemetry.set_recorder(None)
+    replayed = await replay_stateful_proportional_valves_from_records(rows)
+    assert [row["cancelled"] for row in replayed] == [False, True, False, False]
+    assert [row["last_command"] for row in replayed] == [65, None, 65, 65]

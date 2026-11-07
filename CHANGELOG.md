@@ -36,6 +36,17 @@
   150 MB total retention limits; `NaN`, `+Inf` and `-Inf` remain distinguishable on round-trip.
 - Adds plant aggregation/override, OpenTherm target/update and proportional-valve decision records.
   Reported HA states and completed service calls are not proof of physical actuation or flow.
+- PWM records now include the engine's calculation clock read; older records only have a later
+  record timestamp and may replay differently at timing boundaries.
+- Adds selected raw temperature events, control-setting changes, effective aggregation inputs,
+  zone mode resolution, calendar override snapshots, DHW freezes, weather compensation, frost
+  checks, anti-seize lifecycles and zone-control skip reasons.
+- Records relay emergency-off and delayed-task lifecycles, OpenTherm diagnostic inputs and
+  inferred state, and effective schedule-evaluation inputs, manual override mutations and
+  smart-start observations. Calendar and schedule snapshots can reveal household routines;
+  unrelated complex configuration values are not logged.
+- Input, configuration and override logging remains selective; it is not a complete history.
+  Independent physical flow and actuator feedback are not included.
 - A Diagnostics options page controls telemetry file logging (on by default) and optional debug
   sensors (off by default). Debug sensors expose the latest PID, estimator, valve-PWM and boiler
   records; enabling them without file logging retains data only in memory.
@@ -47,6 +58,36 @@
 - Added deterministic replay drivers for PID, PWM and rate estimators, synthetic room and sensor
   scenarios, and a frozen PID reference for differential tests. PID record replay starts at a
   clean-state boundary; dead-sensor records are skipped.
+- Adds record-driven replay for contiguous estimator epochs, aggregation, individual orchestrator
+  decisions, complete frost scans, anti-seize cycles (including supported failures and
+  cancellations), proportional-valve decisions and linked command-state histories, delayed relay
+  task rechecks and lifecycles, weather feed-forward and learning-phase hysteresis, OpenTherm
+  diagnostics, updates and commands, plus a synthetic stateful relay-plant simulation using the
+  real orchestrator. Full stateful replay of real plant recordings remains incomplete.
+- Adds a limited real-recording link from normal plant decisions to contiguous boiler PWM calculations;
+  unsupported and incomplete lifecycles are rejected rather than inferred.
+- Captures relay input reads and backend state for replaying sequential plant updates through the
+  real relay backend without valve delay, including master-off operations and switch-service errors
+  and cancellation. Delayed, overlapping and other non-update lifecycles remain outside this replay
+  path; older records lack the required trace.
+- Captures delayed relay command inputs and outcomes, allowing the actual command implementation
+  to be replayed alongside a recorded delay lifecycle; this is not full asynchronous plant replay.
+- Links a single non-overlapping recorded plant update to its real delayed task and relay command,
+  checking the recorded wait duration and replaying the recorded switch-path decision separately.
+  Consecutive delayed cycles are replayed individually with backend and PWM continuity checks.
+- Replays sequential plant updates against one relay backend while a single delayed task is pending,
+  including cancellation of an already-waiting task by the final update, with recorded wait and
+  state checks. A cancellation not caused by a replayed update can be injected into the waiting
+  task, but its source is unknown. Unsupported overlaps are rejected; this is not full asynchronous
+  plant reconstruction.
+- Replays consecutive non-overlapping waiting cycles with backend and PWM continuity checks; each
+  cycle is independently seeded rather than sharing a backend across the entire recording.
+- Replays individual schedule evaluations from effective recorded inputs, including profile expiry,
+  manual overrides and decisions from recorded smart-return plans. Plan calculation replays from
+  unrounded effective inputs and can be linked to evaluations by identifier. Sequential schedule
+  replay checks lifecycle and state continuity and accepts saved-configuration checkpoints;
+  manual override set/clear mutations are recorded and linked to evaluations. Other override and
+  configuration lifecycles are not fully reconstructed.
 - Added strict expected-failure tests for known PID, PWM, estimator, sync and simulated plant
   defects. `pytest --show-red` runs these as ordinary failing tests. Simulated plant results are
   not a substitute for real installation validation.
@@ -56,6 +97,9 @@
   `scripts/mzt_capture.py`, for selected entity observations, markers, candidate alerts and
   optional telemetry snapshots. It polls, can miss short transitions, and cannot establish
   physical valve position or flow.
+- Current replay and numerical coverage still require validation against installation telemetry
+  and independent ground-truth datasets. Some test ordering under parallel `pytest-xdist` runs
+  can expose Home Assistant mock leakage; a passing parallel run does not resolve that issue.
 
 ### Refactor: Pluggable heating/cooling rate estimators
 - New `rate_estimators.py` defines the estimator contract (`update(ts, temp, is_heating)`, `heating_rate`, `cooling_rate`, optional `dump_state`/`load_state`), a registry (`register_estimator`) and the original algorithm as `LegacyEmaEstimator`, which remains the default so behaviour is unchanged.

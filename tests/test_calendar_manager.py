@@ -1,6 +1,7 @@
 """Tests for Calendar Manager."""
 
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
@@ -9,6 +10,7 @@ import pytest
 
 from custom_components.multizone_thermostat.calendar_manager import CalendarManager
 from custom_components.multizone_thermostat.const import CONF_ZONE_NAME
+from custom_components.multizone_thermostat import telemetry
 
 @pytest.fixture
 def mock_coordinator():
@@ -47,6 +49,31 @@ def mock_coordinator():
     }
     
     return coord
+
+
+@pytest.mark.asyncio
+async def test_calendar_override_snapshots_do_not_expose_titles(mock_coordinator, tmp_path):
+    """ASHRAE Addendum y §5.21.11: adapted operating override visibility."""
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    try:
+        manager = CalendarManager(mock_coordinator)
+        now = datetime.now(timezone.utc)
+        await manager._async_process_calendar_events(
+            [{"start": now.isoformat(), "summary": "Living Room: 21 bypass"}], None, now,
+        )
+        await manager._async_process_calendar_events([], None, now)
+        recorder.flush()
+        rows = [r["data"] for r in telemetry.read_records([str(p) for p in Path(tmp_path).glob("*.jsonl")])
+                if r["data"].get("event") == "calendar_overrides"]
+        zone = "climate.multizone_thermostat_living_room"
+        assert len(rows) == 2
+        assert rows[0]["active_event"] and rows[0]["current"] == {zone: 21}
+        assert rows[0]["modes"] == {zone: "bypass"}
+        assert not rows[1]["active_event"] and rows[1]["current"] == {} and rows[1]["modes"] == {}
+        assert "summary" not in rows[0] and "active_event_id" not in rows[0]
+    finally:
+        telemetry.set_recorder(None)
 
 
 @pytest.mark.asyncio

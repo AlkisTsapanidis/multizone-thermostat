@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timedelta, time as dt_time
 import logging
 import time
@@ -56,6 +57,14 @@ from .const import (
     CONF_ZONE_TRV_SYNC,
     CONF_ZONE_ANTI_SEIZE,
     CONF_ZONE_CLIMATES,
+    CONF_ZONE_SWITCHES,
+    CONF_ZONE_VALVES,
+    CONF_ZONE_TEMP_SENSOR,
+    CONF_ZONE_TARGET_TEMP,
+    CONF_ZONE_WEIGHT,
+    CONF_VALVE_SCALE,
+    CONF_ZONE_SENSOR_TIMEOUT,
+    CONF_ZONE_AUTHORITATIVE_SYNC,
     DOMAIN,
     GLOBAL_PRESET_MANUAL,
     HVAC_ACTION_HEATING,
@@ -123,6 +132,43 @@ PRESET_STORAGE_KEY = f"{DOMAIN}.presets"
 PRESET_STORAGE_VERSION = 1
 SETTINGS_STORAGE_KEY = f"{DOMAIN}.settings"
 SETTINGS_STORAGE_VERSION = 1
+
+
+def snapshot_control_config(config: Mapping) -> dict:
+    """Copy allowlisted control configuration without unrelated entry data."""
+    snapshot = {}
+    scalar_keys = (
+        CONF_BOILER_MODE, CONF_RATE_ESTIMATOR, CONF_BOILER_SWITCH, CONF_OPENTHERM_ENTITY,
+        CONF_OPENTHERM_MIN_TEMP, CONF_OPENTHERM_MAX_TEMP, CONF_OPENTHERM_CH_SWITCH,
+        CONF_WEATHER_SENSOR, CONF_MIN_CYCLE_ON, CONF_MIN_CYCLE_OFF, CONF_VALVE_DELAY,
+        CONF_DERIVATIVE_WINDOW, CONF_DERIVATIVE_LIMIT, CONF_TELEMETRY_ENABLED, CONF_DEBUG_SENSORS,
+    )
+    for key in scalar_keys:
+        value = config.get(key)
+        if key in config and (isinstance(value, (str, bool, int, float)) or value is None):
+            snapshot[key] = value
+    configured_zones = config.get(CONF_ZONES)
+    if isinstance(configured_zones, list):
+        zone_keys = (
+            CONF_ZONE_NAME, CONF_ZONE_CLIMATES, CONF_ZONE_SWITCHES, CONF_ZONE_VALVES,
+            CONF_ZONE_TEMP_SENSOR, CONF_ZONE_TARGET_TEMP, CONF_ZONE_WEIGHT, CONF_VALVE_SCALE,
+            CONF_ZONE_SENSOR_TIMEOUT, CONF_ZONE_AUTHORITATIVE_SYNC, CONF_ZONE_WINDOW_SENSOR,
+            CONF_ZONE_ANTI_SEIZE, CONF_ZONE_TRV_SYNC, CONF_ZONE_ALLOW_PASSIVE_HEAT,
+        )
+        zones = []
+        for zone in configured_zones:
+            if not isinstance(zone, Mapping):
+                continue
+            item = {}
+            for key in zone_keys:
+                value = zone.get(key)
+                if key in zone and (isinstance(value, (str, bool, int, float)) or value is None):
+                    item[key] = value
+                elif isinstance(value, list) and all(isinstance(part, str) for part in value):
+                    item[key] = value.copy()
+            zones.append(item)
+        snapshot[CONF_ZONES] = zones
+    return snapshot
 
 
 class MultizoneCoordinator:
@@ -352,6 +398,12 @@ class MultizoneCoordinator:
         """Set a persistent setting."""
         self._settings[key] = value
         await self._settings_store.async_save(self._settings)
+        if isinstance(value, (int, float, bool)) or value is None:
+            telemetry.get_recorder().record(telemetry.KIND_CONFIG, None, source="persistent_setting", key=key, value=value)
+        elif isinstance(value, str) and key in (KEY_RATE_ESTIMATOR, "demand_strategy"):
+            telemetry.get_recorder().record(telemetry.KIND_CONFIG, None, source="persistent_setting", key=key, value=value)
+        else:
+            telemetry.get_recorder().record(telemetry.KIND_CONFIG, None, source="persistent_setting", key=key, value_recorded=False)
 
 
 
@@ -549,6 +601,7 @@ class MultizoneCoordinator:
 
         # Start periodic PWM evaluation (every 10 seconds)
         self._start_telemetry()
+        self._start_telemetry_inputs()
         self._unsub_listeners.append(
             async_track_time_interval(
                 self.hass,
@@ -615,8 +668,94 @@ class MultizoneCoordinator:
             self._unsub_listeners.append(
                 async_track_time_interval(self.hass, self._async_flush_telemetry, timedelta(seconds=30))
             )
+            settings = getattr(self, "_settings", {})
+            settings = settings if isinstance(settings, dict) else {}
+            control_settings = {
+                key: value for key, value in settings.items()
+                if isinstance(value, (bool, int, float)) or
+                (key in (KEY_RATE_ESTIMATOR, KEY_DEMAND_STRATEGY) and isinstance(value, str))
+            }
+            zones = snapshot_control_config({CONF_ZONES: getattr(self, "zones", [])}).get(CONF_ZONES, [])
+            self._telemetry.record(
+                telemetry.KIND_CONFIG, None, source="startup", settings=control_settings,
+                zones=zones,
+                boiler_mode=getattr(self, "boiler_mode", None),
+                boiler_switch=getattr(self, "boiler_switch", None),
+                opentherm_entity=getattr(self, "opentherm_entity", None),
+                opentherm_ch_switch=getattr(self, "opentherm_ch_switch", None),
+                opentherm_min_temp=getattr(self, "opentherm_min_temp", None),
+                opentherm_max_temp=getattr(self, "opentherm_max_temp", None),
+                weather_sensor=getattr(self, "weather_sensor_id", None),
+                min_cycle_on=getattr(self, "_min_cycle_on", None),
+                min_cycle_off=getattr(self, "_min_cycle_off", None),
+                valve_delay=getattr(self, "_valve_delay", None),
+                derivative_window=getattr(self, "_derivative_window_min", None),
+                derivative_limit=getattr(self, "_derivative_limit_pct", None),
+                rate_estimator=getattr(self, "rate_estimator", None),
+            )
+            schedule = getattr(self, "schedule_manager", None)
+            if schedule is not None:
+                schedule.record_schedule_state("schedule_startup")
         except Exception as err:  # telemetry must never prevent the integration from starting
             _LOGGER.warning("Telemetry disabled: %s", err)
+
+    def _start_telemetry_inputs(self) -> None:
+        """Observe configured HA inputs without issuing actuator commands."""
+        if not telemetry.get_recorder().enabled:
+            return
+        entities = set()
+        for value in (self.boiler_switch, self.opentherm_entity, self.opentherm_ch_switch,
+                      self.weather_sensor_id, self.presence_sensor):
+            if isinstance(value, str) and value and value != "none":
+                entities.add(value)
+        for zone in self.zones:
+            if not isinstance(zone, dict):
+                continue
+            name = zone.get(CONF_ZONE_NAME)
+            if name:
+                entities.add(make_zone_entity_id(name))
+            for key in (CONF_ZONE_TEMP_SENSOR, CONF_ZONE_WINDOW_SENSOR):
+                value = zone.get(key)
+                if isinstance(value, str) and value and value != "none":
+                    entities.add(value)
+            for key in (CONF_ZONE_CLIMATES, CONF_ZONE_SWITCHES, CONF_ZONE_VALVES):
+                values = zone.get(key)
+                if isinstance(values, list):
+                    entities.update(value for value in values if isinstance(value, str) and value)
+        if not entities:
+            return
+        try:
+            self._unsub_listeners.append(async_track_state_change_event(
+                self.hass, sorted(entities), self._record_telemetry_input_event,
+            ))
+            for entity in sorted(entities):
+                self._record_telemetry_input(entity, self.hass.states.get(entity), "initial")
+        except Exception:
+            _LOGGER.exception("Unable to observe configured telemetry inputs")
+
+    def _record_telemetry_input_event(self, event) -> None:
+        try:
+            self._record_telemetry_input(event.data.get("entity_id"), event.data.get("new_state"), "change")
+        except Exception:
+            _LOGGER.exception("Unable to record configured input change")
+
+    def _record_telemetry_input(self, entity_id, state, source) -> None:
+        attrs = getattr(state, "attributes", None)
+        keys = (
+            "current_temperature", "temperature", "unit_of_measurement", "min", "max",
+            "position", "valve_position", "pi_heating_demand", "heating_demand", "valve_state",
+            "hvac_action", "preset_mode",
+        )
+        values = {}
+        if isinstance(attrs, Mapping):
+            values = {
+                key: attrs[key] for key in keys if key in attrs
+                and (attrs[key] is None or isinstance(attrs[key], (str, bool, int, float)))
+            }
+        telemetry.get_recorder().record(
+            telemetry.KIND_SENSOR, entity_id, source="configured_input", observation=source,
+            state=getattr(state, "state", None), attributes=values,
+        )
 
     async def _async_flush_telemetry(self, _now=None) -> None:
         recorder = getattr(self, "_telemetry", None)
@@ -656,6 +795,13 @@ class MultizoneCoordinator:
     async def _async_on_climate_state_changed(self, event) -> None:
         entity_id = event.data.get("entity_id")
         new_state = event.data.get("new_state")
+        attrs = getattr(new_state, "attributes", None)
+        telemetry.get_recorder().record(
+            telemetry.KIND_SENSOR, entity_id, source="zone_climate",
+            state=getattr(new_state, "state", None),
+            temperature=attrs.get("current_temperature") if isinstance(attrs, Mapping) else None,
+            target=attrs.get("temperature") if isinstance(attrs, Mapping) else None,
+        )
         if not new_state:
             return
         await self._async_refresh_zone(entity_id, new_state)
@@ -745,4 +891,3 @@ class MultizoneCoordinator:
             {ATTR_ENTITY_ID: climate_entity, ATTR_HVAC_MODE: mode},
             blocking=False,
         )
-

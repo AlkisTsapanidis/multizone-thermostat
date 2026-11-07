@@ -1,11 +1,17 @@
 """Tests for PID recovery and integral/timestamp reset after DHW production (roadmap 4.5)."""
 import time
+from copy import deepcopy
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from custom_components.multizone_thermostat.zone_controller import ZoneController, make_zone_entity_id
 from custom_components.multizone_thermostat.pid_wrapper import MultizonePID
+from custom_components.multizone_thermostat import telemetry
+from tests.mzt_replay.drivers import (
+    replay_hysteresis_from_records, replay_weather_compensation_from_records, replay_zone_control_skips_from_records,
+)
 
 
 class DummyState:
@@ -114,3 +120,160 @@ def test_multizone_pid_clear_samples_resets_all_timing_and_integral():
         assert pid._pid._dt == 0.0
         assert pid._pid.integral == 0.0
         assert demand == pytest.approx(20.0)  # Pure proportional: 10.0 * 2.0
+
+
+@pytest.mark.asyncio
+async def test_zone_dhw_and_weather_decisions_are_observable(tmp_path):
+    """ASHRAE Addendum y §5.21.11: adapted DHW and weather decision visibility."""
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    try:
+        coord, demands = _create_mock_coordinator()
+        coord.get_persistent_data.side_effect = lambda key, default: 1.0 if key == "weather_curve" else default
+        coord.weather_sensor_id = "sensor.outdoor"
+        controller = ZoneController(MagicMock(), coord)
+        cid = make_zone_entity_id("Salone")
+        controller.get_autotuner(cid).state = controller.get_autotuner(cid).STATE_COMPLETED
+        controller.get_pid(cid).set_pid_param(kp=10, ki=0, kd=0)
+        controller._outdoor_temp = MagicMock(return_value=0)
+        controller._thermal_models[cid].get_weather_multiplier = MagicMock(return_value=2)
+        state = DummyState(current_temp=19.8, target_temp=20)
+        result = await controller.async_update_zone(cid, state, learn=False)
+        assert result == pytest.approx(18)
+        coord.is_dhw_active = True
+        assert await controller.async_update_zone(cid, state, learn=False) == result
+        coord.is_dhw_active = False
+        await controller.async_update_zone(cid, state, learn=False)
+        recorder.flush()
+        rows = [r["data"] for r in telemetry.read_records([str(p) for p in Path(tmp_path).glob("*.jsonl")])
+                if r["kind"] == "event"]
+        dhw = [r for r in rows if r["event"] == "zone_dhw"]
+        assert [(r["active"], r["previously_active"], r["reset_all"], r["pid_frozen"]) for r in dhw] == [
+            (False, False, False, False), (True, False, False, True), (False, True, True, False),
+        ]
+        assert next(r for r in rows if r["event"] == "zone_dhw_held_demand")["demand"] == result
+        weather = next(r for r in rows if r["event"] == "weather_compensation")
+        assert weather["raw_curve"] == weather["manual_curve"] == 1
+        assert weather["effective_curve"] == 2 and weather["outdoor_temp"] == 0
+        assert weather["feed_forward"] == pytest.approx(16)
+        assert weather["pid_demand"] == pytest.approx(2)
+        assert weather["demand"] == pytest.approx(result)
+    finally:
+        telemetry.set_recorder(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current,outdoor,curve,expected_ff,applied", [
+    (18.0, 0.0, 2.0, 40.0, True),
+    (20.1, 0.0, 2.0, 0.0, True),
+    (19.8, None, 2.0, 0.0, False),
+    (19.8, 25.0, 2.0, 0.0, False),
+    (19.8, 0.0, 0.0, 0.0, False),
+])
+async def test_weather_observation_covers_feed_forward_boundaries(tmp_path, current, outdoor, curve, expected_ff, applied):
+    """ASHRAE Addendum y §5.21.4: adapted weather reset observations, not its sequence."""
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    try:
+        coord, _ = _create_mock_coordinator()
+        coord.get_persistent_data.side_effect = lambda key, default: curve if key == "weather_curve" else default
+        coord.weather_sensor_id = "sensor.outdoor"
+        controller = ZoneController(MagicMock(), coord)
+        cid = make_zone_entity_id("Salone")
+        controller.get_autotuner(cid).state = controller.get_autotuner(cid).STATE_COMPLETED
+        controller.get_pid(cid).set_pid_param(kp=10, ki=0, kd=0)
+        controller._outdoor_temp = MagicMock(return_value=outdoor)
+        controller._thermal_models[cid].get_weather_multiplier = MagicMock(return_value=curve)
+        result = await controller.async_update_zone(cid, DummyState(current_temp=current), learn=False)
+        recorder.flush()
+        records = list(telemetry.read_records([str(p) for p in Path(tmp_path).glob("*.jsonl")]))
+        events = [r["data"] for r in records if r["kind"] == "event"
+                  and r["data"].get("event") == "weather_compensation"]
+        assert len(events) == 1
+        assert events[0]["applied"] is applied
+        assert events[0]["feed_forward"] == pytest.approx(expected_ff)
+        assert events[0]["demand"] == pytest.approx(result)
+        telemetry.set_recorder(None)
+        replayed = await replay_weather_compensation_from_records(records)
+        assert replayed[0][1] == pytest.approx(result)
+        missing = deepcopy(records)
+        next(row["data"] for row in missing if row["data"].get("event") == "weather_compensation").pop("raw_curve")
+        with pytest.raises(ValueError, match="lacks replay inputs"):
+            await replay_weather_compensation_from_records(missing)
+        divergent = deepcopy(records)
+        next(row["data"] for row in divergent if row["data"].get("event") == "weather_compensation")["demand"] += 1
+        with pytest.raises(ValueError, match="diverged"):
+            await replay_weather_compensation_from_records(divergent)
+    finally:
+        telemetry.set_recorder(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current,previous,expected", [
+    (19.7, 42, 100), (20.3, 42, 0), (20, 42, 42), (19.8, 0, 0), (20.2, 100, 100),
+])
+async def test_hysteresis_replays_captured_previous_demand(tmp_path, current, previous, expected):
+    """ASHRAE Addendum y §5.21.11: adapted learning-mode decision recording."""
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    try:
+        coord, demands = _create_mock_coordinator()
+        controller = ZoneController(MagicMock(), coord)
+        cid = make_zone_entity_id("Salone")
+        demands[cid] = previous
+        result = await controller.async_update_zone(cid, DummyState(current_temp=current), learn=False)
+        assert result == expected
+        recorder.flush()
+        rows = list(telemetry.read_records([str(p) for p in Path(tmp_path).glob("*.jsonl")]))
+        telemetry.set_recorder(None)
+        assert (await replay_hysteresis_from_records(rows))[0][1] == expected
+        missing = deepcopy(rows)
+        next(row["data"] for row in missing if row["data"].get("event") == "hysteresis_demand").pop("previous_demand")
+        with pytest.raises(ValueError, match="lacks replay inputs"):
+            await replay_hysteresis_from_records(missing)
+    finally:
+        telemetry.set_recorder(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "missing_temperature", "invalid_temperature", "unregistered_zone", "critical_sensor_fault", "inactive_mode",
+])
+async def test_zone_control_early_exit_is_observable(tmp_path, reason):
+    """ASHRAE Addendum y §5.21.11: adapted missing-input and operating-state observation."""
+    recorder = telemetry.JsonlRecorder(str(tmp_path))
+    telemetry.set_recorder(recorder)
+    try:
+        coord, demands = _create_mock_coordinator()
+        controller = ZoneController(MagicMock(), coord)
+        cid = make_zone_entity_id("Salone")
+        demands[cid] = 50
+        state = DummyState()
+        if reason == "missing_temperature":
+            state.attributes["current_temperature"] = None
+        elif reason == "invalid_temperature":
+            state.attributes["current_temperature"] = "unknown"
+        elif reason == "unregistered_zone":
+            controller._pids.pop(cid)
+        elif reason == "critical_sensor_fault":
+            coord.plant_diagnostics.has_critical_sensor_fault.return_value = True
+        else:
+            state.state = "off"
+        assert await controller.async_update_zone(cid, state, learn=False) == 0
+        recorder.flush()
+        records = list(telemetry.read_records([str(p) for p in Path(tmp_path).glob("*.jsonl")]))
+        rows = [r["data"] for r in records if r["data"].get("event") == "zone_control_skipped"]
+        assert len(rows) == 1 and rows[0]["reason"] == reason
+        assert rows[0]["demand_updated"] is (reason != "unregistered_zone")
+        assert demands[cid] == (50 if reason == "unregistered_zone" else 0)
+        telemetry.set_recorder(None)
+        replayed = (await replay_zone_control_skips_from_records(records))[0]
+        assert replayed["result"] == 0
+        assert replayed["updates"] == ([] if reason == "unregistered_zone" else [(cid, 0)])
+        divergent = deepcopy(records)
+        next(r["data"] for r in divergent if r["data"].get("event") == "zone_control_skipped")["demand_updated"] = False
+        if reason != "unregistered_zone":
+            with pytest.raises(ValueError, match="diverged"):
+                await replay_zone_control_skips_from_records(divergent)
+    finally:
+        telemetry.set_recorder(None)

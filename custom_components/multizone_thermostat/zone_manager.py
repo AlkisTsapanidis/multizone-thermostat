@@ -6,6 +6,7 @@ from homeassistant.components.climate.const import HVACMode
 from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN, SERVICE_SET_PRESET_MODE, SERVICE_SET_TEMPERATURE
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE
 
+from . import telemetry
 from .const import (
     CONF_ZONE_NAME,
     CONF_ZONE_CLIMATES,
@@ -78,14 +79,31 @@ class ZoneManager:
     def get_zone_mode(self, climate_entity: str) -> str:
         """Get current zone mode, prioritizing window-open bypass and calendar overrides."""
         if climate_entity in self._pre_window_state and self._zone_modes.get(climate_entity) == ZONE_MODE_BYPASS:
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, climate_entity, event="zone_mode_resolved",
+                source="window", mode=ZONE_MODE_BYPASS,
+            )
             return ZONE_MODE_BYPASS
         if hasattr(self.coordinator, "calendar_manager") and climate_entity in self.coordinator.calendar_manager.mode_overrides:
-            return self.coordinator.calendar_manager.mode_overrides[climate_entity]
-        return self._zone_modes.get(climate_entity, ZONE_MODE_PRIMARY)
+            mode = self.coordinator.calendar_manager.mode_overrides[climate_entity]
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, climate_entity, event="zone_mode_resolved", source="calendar", mode=mode,
+            )
+            return mode
+        mode = self._zone_modes.get(climate_entity, ZONE_MODE_PRIMARY)
+        telemetry.get_recorder().record(
+            telemetry.KIND_EVENT, climate_entity, event="zone_mode_resolved", source="configured", mode=mode,
+        )
+        return mode
 
     def set_zone_mode(self, climate_entity: str, mode: str, save_to_preset: bool = True) -> None:
         """Set zone mode and persist/update dependencies."""
+        previous_mode = self._zone_modes.get(climate_entity)
         self._zone_modes[climate_entity] = mode
+        telemetry.get_recorder().record(
+            telemetry.KIND_EVENT, climate_entity, event="zone_mode_changed",
+            previous_mode=previous_mode, mode=mode, save_to_preset=save_to_preset,
+        )
         self.coordinator.demand_aggregator.set_zone_mode(climate_entity, mode)
 
         # Persist zone mode directly in settings (copy & update synchronously to avoid race across multiple zones)
@@ -212,6 +230,10 @@ class ZoneManager:
         """Handle window sensor state changes → bypass/restore zone."""
         sensor_id = event.data.get("entity_id")
         new_state = event.data.get("new_state")
+        telemetry.get_recorder().record(
+            telemetry.KIND_SENSOR, None, source="window", entity=sensor_id,
+            state=getattr(new_state, "state", None),
+        )
         
         _LOGGER.debug("Window listener fired: %s -> %s", sensor_id, new_state.state if new_state else "None")
 

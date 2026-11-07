@@ -72,7 +72,7 @@ def _fake_coordinator(tmp_path, telemetry_enabled, debug_sensors):
     hass = MagicMock()
     hass.config.path.return_value = str(tmp_path / "mzt_telemetry")
     return types.SimpleNamespace(hass=hass, telemetry_enabled=telemetry_enabled, debug_sensors=debug_sensors,
-                                 _unsub_listeners=[], _telemetry=None)
+                                 _unsub_listeners=[], _telemetry=None, _async_flush_telemetry=MagicMock())
 
 
 @pytest.fixture
@@ -90,6 +90,8 @@ def clean_recorder():
 ])
 def test_start_telemetry_honours_options(tmp_path, clean_recorder, enabled, debug, expect_recorder, expect_persist):
     fake = _fake_coordinator(tmp_path, enabled, debug)
+    fake.zones = [{"name": "Room", "switch_entities": ["switch.valve"], "private": "do not log"}]
+    fake._settings = {"weather_curve": 1.5, "private": {"token": "do not log"}}
     with patch.object(coord_mod, "async_track_time_interval", MagicMock()):
         coord_mod.MultizoneCoordinator._start_telemetry(fake)
     if not expect_recorder:
@@ -97,6 +99,13 @@ def test_start_telemetry_honours_options(tmp_path, clean_recorder, enabled, debu
     else:
         assert pkg_telemetry.get_recorder() is fake._telemetry
         assert fake._telemetry.persist is expect_persist
+        data = fake._telemetry.latest(None, pkg_telemetry.KIND_CONFIG)["data"]
+        assert data["source"] == "startup"
+        assert data["zones"] == [{"name": "Room", "switch_entities": ["switch.valve"]}]
+        assert data["settings"] == {"weather_curve": 1.5}
+        fake.zones[0]["switch_entities"].append("switch.changed")
+        assert data["zones"][0]["switch_entities"] == ["switch.valve"]
+        assert "do not log" not in repr(data)
 
 
 # ------------------------------- debug sensors -------------------------------

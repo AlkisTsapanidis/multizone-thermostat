@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import telemetry
 from .const import (
     CONF_ZONE_NAME,
     ZONE_MODE_BYPASS,
@@ -293,15 +294,42 @@ class DemandAggregator:
 
         primary_demands: dict[str, float] = {}
         secondary_demands: dict[str, float] = {}
+        recorder = telemetry.get_recorder()
+        observed_zones = [] if recorder.enabled else None
+        weight_calls = []
+
+        def read_weight(cid):
+            weight = self.get_zone_weight(cid)
+            if observed_zones is not None:
+                weight_calls.append({"id": cid, "weight": weight})
+            return weight
+
+        def record_result(result):
+            if observed_zones is not None:
+                recorder.record(
+                    telemetry.KIND_AGGREGATION, "boiler", zones=observed_zones,
+                    strategy=self._strategy, dhw_active=is_dhw_active, frost_emergency=frost_emergency,
+                    weight_calls=weight_calls, demand=result.demand, peak_zone=result.peak_zone,
+                )
+            return result
 
         for cid, name in zone_entries:
             mode = self.get_zone_mode(cid)
             demand = self.get_zone_demand(cid)
+            input_demand = demand
 
             coord = getattr(self, "coordinator", None)
+            fault_suppressed = False
             if coord and hasattr(coord, "plant_diagnostics") and coord.plant_diagnostics.has_critical_sensor_fault(cid):
                 demand = 0.0
+                fault_suppressed = True
 
+            if observed_zones is not None:
+                observed_zones.append({
+                    "id": cid, "name": name, "mode": mode, "input_demand": input_demand,
+                    "effective_demand": demand, "fault_suppressed": fault_suppressed,
+                    "configured_weight": self._zone_weights.get(cid, DEFAULT_ZONE_WEIGHT),
+                })
             if mode == ZONE_MODE_BYPASS:
                 continue
             elif mode == ZONE_MODE_SECONDARY:
@@ -312,11 +340,10 @@ class DemandAggregator:
 
         active_primary = sum(1 for d in primary_demands.values() if d > 0.0)
         active_secondary = sum(1 for d in secondary_demands.values() if d > 0.0)
-
         # 1. Domestic Hot Water Priority Interlock
         if is_dhw_active:
             _LOGGER.debug("DHW is active: plant heating demand suppressed to 0.0%%")
-            return AggregatedDemand(
+            return record_result(AggregatedDemand(
                 demand=0.0,
                 peak_zone=None,
                 strategy=self._strategy,
@@ -326,12 +353,12 @@ class DemandAggregator:
                 active_secondary_count=active_secondary,
                 frost_emergency=False,
                 dhw_active=True,
-            )
+            ))
 
         # 2. Frost Emergency Priority Override
         if frost_emergency:
             _LOGGER.debug("Frost emergency active: plant heating demand forced to 100.0%%")
-            return AggregatedDemand(
+            return record_result(AggregatedDemand(
                 demand=100.0,
                 peak_zone="Frost Emergency",
                 strategy=self._strategy,
@@ -341,11 +368,11 @@ class DemandAggregator:
                 active_secondary_count=active_secondary,
                 frost_emergency=True,
                 dhw_active=False,
-            )
+            ))
 
         # 3. Normal Aggregation (evaluated over Primary zones)
         if not primary_demands:
-            return AggregatedDemand(
+            return record_result(AggregatedDemand(
                 demand=0.0,
                 peak_zone=None,
                 strategy=self._strategy,
@@ -355,7 +382,7 @@ class DemandAggregator:
                 active_secondary_count=active_secondary,
                 frost_emergency=False,
                 dhw_active=False,
-            )
+            ))
 
         # Calculate peak zone and demand by strategy
         if self._strategy == DEMAND_STRATEGY_MAX:
@@ -380,11 +407,11 @@ class DemandAggregator:
                 peak_zone = None
             else:
                 weighted_sum = sum(
-                    demand * self.get_zone_weight(cid)
+                    demand * read_weight(cid)
                     for cid, _, demand in active_items
                 )
                 weight_sum = sum(
-                    self.get_zone_weight(cid)
+                    read_weight(cid)
                     for cid, _, _ in active_items
                 )
                 if weight_sum > 0:
@@ -409,7 +436,7 @@ class DemandAggregator:
             final_demand = 0.0
             peak_zone = None
 
-        return AggregatedDemand(
+        return record_result(AggregatedDemand(
             demand=final_demand,
             peak_zone=peak_zone,
             strategy=self._strategy,
@@ -419,7 +446,7 @@ class DemandAggregator:
             active_secondary_count=active_secondary,
             frost_emergency=False,
             dhw_active=False,
-        )
+        ))
 
     def has_active_primary_demand(self) -> bool:
         """Return True if any primary zone has demand > 0%."""

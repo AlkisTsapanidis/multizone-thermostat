@@ -25,10 +25,33 @@ For deployment checks and real-world data collection, see
   scenarios; strict expected failures can be run as ordinary failing tests with `--show-red`.
 - [x] Added adapted ASHRAE Addendum y section-referenced tests for selected plant decisions,
   OpenTherm mapping and proportional-valve command observation; these do not establish conformance.
+- [x] Added selected sensor and configuration events, aggregation inputs, frost/anti-seize
+  lifecycle observations, record replay for estimator epochs, aggregation, individual plant
+  decisions, complete frost scans, selected anti-seize failures and cancellations, linked
+  proportional-valve decisions, delayed relay task lifecycles and rechecks, and OpenTherm
+  updates/commands, and an orchestrated synthetic relay-plant replay.
+  See the telemetry guide for boundaries and omissions.
+- [x] Linked sequential recorded plant decisions to a stateful real relay backend for updates
+  without valve delays and master-off operations, including switch-service errors and cancellation,
+  checking recorded inputs, commands and backend state. One non-overlapping delayed cycle can
+  also replay through the real delayed task and relay command; consecutive non-overlapping
+  cycles are checked for continuity. Sequential updates during a single pending delay can also
+  share a backend and task, including a final update that cancels an already-waiting task;
+  otherwise, cancellation during a wait can be injected with its source marked unknown.
+  Consecutive waiting cycles are independently replayed with backend and PWM continuity checks.
+  Switch-path decisions are independently replayed. Full asynchronous recorded-plant replay remains outstanding.
+- [x] Captured schedule evaluation inputs and before/after overrides, and replayed individual
+  evaluations including decisions based on captured smart-return plans. Plan calculations replay
+  from effective raw inputs and can be linked to evaluations by identifier. Sequential
+  evaluation replay checks lifecycle and state continuity, including captured manual set/clear
+  mutations; other override and configuration lifecycles remain open.
 - [x] The existing GitHub Actions workflow runs the test suite. This records the configured
   CI step, not a claim that a particular remote run passed.
 - [ ] Complete instrumentation, replay and ground-truth coverage for every numerical and
   control path, including real installation telemetry and full plant orchestration.
+- [x] Record the PWM engine's actual calculation clock read without changing its numerical
+  calculation; boundary tests cover valve and boiler records. Older records do not contain it.
+- [ ] Validate exact replay with captured real installation telemetry.
 - [ ] Validate on captured real-world logs and known datasets before changing numerical
   control behavior or changing the default estimator. The legacy estimator remains the default.
 
@@ -745,9 +768,10 @@ def export_as_csv(zone_id: str, output_file: str):
 - [x] Integrate the recorder lifecycle with the Home Assistant coordinator
 - [ ] Test on real system; capture 24+ hours of logs
 
-**Partial:** Plant aggregation, OpenTherm, proportional valves and override decisions now emit
-records, but effective aggregation modes/weights, complete frost/anti-seize internals, raw sensor
-events, configuration changes and independent physical feedback still need instrumentation.
+**Partial:** Selected sensor and configuration events and frost/anti-seize internals are now
+recorded, but not every raw event, configuration value or override transition. Full stateful plant
+replay from real recordings remains outstanding. Independent physical feedback is deferred until suitable
+hardware and testing are available.
 **Deliverable outstanding:** First verified real log file with control decisions.
 
 ### Week 2: Replay Engine & Export

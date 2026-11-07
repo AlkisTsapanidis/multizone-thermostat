@@ -21,7 +21,7 @@ from .const import (
     CONF_ZONES,
     DOMAIN,
 )
-from .coordinator import MultizoneCoordinator
+from .coordinator import MultizoneCoordinator, snapshot_control_config
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -367,4 +367,10 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     """Handle options update — config_flow already triggers reload via async_reload,
     but this listener acts as a safety net to ensure any direct option changes are applied."""
     _LOGGER.info("Options updated for Multizone Thermostat, reloading integration...")
+    from . import telemetry
+    telemetry.get_recorder().record(
+        telemetry.KIND_CONFIG, None, source="entry_update", entry_id=entry.entry_id,
+        data_keys=list(entry.data), option_keys=list(entry.options),
+        data=snapshot_control_config(entry.data), options=snapshot_control_config(entry.options),
+    )
     await hass.config_entries.async_reload(entry.entry_id)

@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from typing import Any
+from uuid import uuid4
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.climate import HVACMode
@@ -45,6 +46,8 @@ class ZoneSyncManager:
         self._calibrations = calibrations
         self._authoritative_sync = bool(authoritative_sync)
         self._last_valve_positions: dict[str, float] = {}
+        self._valve_replay_epoch = uuid4().hex
+        self._valve_replay_step = 0
 
         self._sync_lock = asyncio.Lock()
         self._trv_event_lock = asyncio.Lock()
@@ -287,6 +290,9 @@ class ZoneSyncManager:
             new_pwm_state = False
             demand = None
             pre = {}
+            calculation_time = None
+            pwm_epoch = None
+            pwm_step = None
         else:
             demand = self._coordinator.get_zone_demand(self._entity_id)
             pre = {
@@ -294,6 +300,9 @@ class ZoneSyncManager:
                 "prev_demand_before": getattr(self._local_pwm, "_prev_demand", 0.0),
             }
             new_pwm_state = self._local_pwm.calculate(demand)
+            calculation_time = self._local_pwm.last_calculation_time
+            pwm_epoch = self._local_pwm.replay_epoch
+            pwm_step = self._local_pwm.replay_step - 1
 
         changed = new_pwm_state != self._local_pwm_state
         self._local_pwm_state = new_pwm_state
@@ -301,7 +310,8 @@ class ZoneSyncManager:
             telemetry.KIND_PWM, self._zone_name, demand=demand, state=new_pwm_state, changed=changed,
             master_off=master_hvac_mode == HVACMode.OFF, time_on=self._local_pwm.time_on,
             time_off=self._local_pwm.time_off, pwm_interval=self._local_pwm.pwm_interval,
-            min_on=self._local_pwm.min_on, min_off=self._local_pwm.min_off, **pre,
+            min_on=self._local_pwm.min_on, min_off=self._local_pwm.min_off,
+            calculation_time=calculation_time, pwm_epoch=pwm_epoch, pwm_step=pwm_step, **pre,
         )
         # Level-triggered: always reconcile so skipped or lost commands are retried
         await self.async_sync_switches()
@@ -338,23 +348,36 @@ class ZoneSyncManager:
         if not self._valves:
             return
 
+        replay_step = self._valve_replay_step
+        self._valve_replay_step += 1
         zone_mode = self._coordinator.get_zone_mode(self._entity_id) if hasattr(self._coordinator, "get_zone_mode") else None
+        raw_demand = None
         if master_hvac_mode == HVACMode.OFF or zone_mode == "bypass":
             target_pct = 0.0
         else:
-            target_pct = float(self._coordinator.get_zone_demand(self._entity_id))
+            raw_demand = float(self._coordinator.get_zone_demand(self._entity_id))
+            target_pct = raw_demand
 
         target_pct = max(0.0, min(100.0, target_pct))
 
-        for valve_entity in self._valves:
+        for valve_index, valve_entity in enumerate(self._valves):
             st = self.hass.states.get(valve_entity)
-            if not st or st.state == STATE_UNAVAILABLE:
+            state_exists = bool(st)
+            replay_inputs = {
+                "zone_entity": self._entity_id, "raw_demand": raw_demand,
+                "master_off": master_hvac_mode == HVACMode.OFF,
+                "scale": self._valve_scale, "zone_mode": zone_mode,
+                "previous_command": self._last_valve_positions.get(valve_entity),
+                "state_exists": state_exists,
+                "replay_epoch": self._valve_replay_epoch, "replay_step": replay_step,
+                "valve_index": valve_index, "valve_count": len(self._valves),
+            }
+            if not state_exists or st.state == STATE_UNAVAILABLE:
                 _LOGGER.warning("Zone %s: valve %s is unavailable, command skipped", self._zone_name, valve_entity)
                 telemetry.get_recorder().record(
                     telemetry.KIND_VALVE, self._zone_name, entity=valve_entity,
                     target_pct=target_pct, observed=getattr(st, "state", None),
-                    action="skipped_unavailable", master_off=master_hvac_mode == HVACMode.OFF,
-                    zone_mode=zone_mode,
+                    action="skipped_unavailable", **replay_inputs,
                 )
                 continue
             target_val = round(target_pct / 10.0, 1) if self._valve_scale == VALVE_SCALE_VOLT else round(target_pct, 1)
@@ -366,14 +389,15 @@ class ZoneSyncManager:
                 if abs(target_val - last_val) < threshold and target_val not in (0.0, 100.0, 10.0):
                     telemetry.get_recorder().record(
                         telemetry.KIND_VALVE, self._zone_name, entity=valve_entity, target_pct=target_pct,
-                        target_value=target_val, previous_command=last_val, observed=st.state,
-                        action="deadband", scale=self._valve_scale, zone_mode=zone_mode,
+                        target_value=target_val, observed=st.state,
+                        action="deadband", **replay_inputs,
                     )
                     continue
 
             domain = valve_entity.split(".", 1)[0]
             command_error = None
             command_completed = False
+            command_cancelled = False
             supported_domain = domain in ("valve", "number", "input_number")
             try:
                 if domain == "valve":
@@ -392,16 +416,19 @@ class ZoneSyncManager:
                     )
                 command_completed = supported_domain
                 self._last_valve_positions[valve_entity] = target_val
+            except asyncio.CancelledError:
+                command_cancelled = True
+                raise
             except Exception as err:
                 command_error = str(err)
                 _LOGGER.error("Failed to set proportional valve position for %s: %s", valve_entity, err)
             finally:
                 telemetry.get_recorder().record(
                     telemetry.KIND_VALVE, self._zone_name, entity=valve_entity, target_pct=target_pct,
-                    target_value=target_val, previous_command=last_val, observed=st.state,
+                    target_value=target_val, observed=st.state,
                     action="command_attempt" if supported_domain else "unsupported_domain",
-                    scale=self._valve_scale, zone_mode=zone_mode, command_error=command_error,
-                    command_completed=command_completed,
+                    command_error=command_error, command_completed=command_completed,
+                    command_cancelled=command_cancelled, **replay_inputs,
                 )
 
 

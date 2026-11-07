@@ -6,6 +6,7 @@ import homeassistant.util.dt as dt_util
 
 from .calendar_parser import parse_calendar_event
 from .const import CONF_ZONE_NAME, make_zone_entity_id
+from . import telemetry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -292,3 +293,10 @@ class CalendarManager:
         if old_smart_start != self.smart_start_overrides:
             changed_zones = set(old_smart_start.keys()) | set(self.smart_start_overrides.keys())
             self._notify_climates_and_sync_trvs(changed_zones)
+        telemetry.get_recorder().record(
+            telemetry.KIND_EVENT, "boiler", event="calendar_overrides",
+            evaluated_at=now, active_event=self.active_event_id is not None,
+            pre_calendar_preset=self.pre_calendar_preset,
+            current=self.current_event_overrides.copy(), smart_start=self.smart_start_overrides.copy(),
+            modes=self.mode_overrides.copy(),
+        )

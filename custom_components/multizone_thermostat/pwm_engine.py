@@ -1,6 +1,7 @@
 """PWM Engine for translating 0-100% demand into ON/OFF states with Proportional Dilatation."""
 import time
 import logging
+from uuid import uuid4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ class PWMEngine:
         self.current_state = False
         self.time_on = 0.0
         self.time_off = pwm_interval
+        self.last_calculation_time: float | None = None
+        self.replay_epoch = uuid4().hex
+        self.replay_step = 0
         
     def set_params(self, pwm_interval=None, min_on=None, min_off=None):
         if pwm_interval is not None: self.pwm_interval = pwm_interval
@@ -31,6 +35,8 @@ class PWMEngine:
     def calculate(self, demand: float) -> bool:
         """Calculate the current ON/OFF state based on demand (0-100)."""
         now = time.monotonic()
+        self.last_calculation_time = now
+        self.replay_step += 1
         prev_demand = getattr(self, "_prev_demand", 0.0)
         if prev_demand <= 0.0 and demand > 0.0:
             self.cycle_start_time = now

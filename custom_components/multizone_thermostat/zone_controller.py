@@ -153,6 +153,11 @@ class ZoneController:
 
         if current_temp is None or target_temp is None:
             self.coordinator.demand_aggregator.set_zone_demand(entity_id, 0.0)
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, entity_id, event="zone_control_skipped", reason="missing_temperature",
+                current_present=current_temp is not None, target_present=target_temp is not None,
+                demand=0.0, demand_updated=True,
+            )
             return 0.0
 
         try:
@@ -160,12 +165,24 @@ class ZoneController:
             target_temp = float(target_temp)
         except (ValueError, TypeError):
             self.coordinator.demand_aggregator.set_zone_demand(entity_id, 0.0)
+            current_captured = current_temp is None or isinstance(current_temp, (str, bool, int, float))
+            target_captured = target_temp is None or isinstance(target_temp, (str, bool, int, float))
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, entity_id, event="zone_control_skipped", reason="invalid_temperature",
+                current_temp=current_temp if current_captured else None,
+                target_temp=target_temp if target_captured else None,
+                inputs_captured=current_captured and target_captured, demand=0.0, demand_updated=True,
+            )
             return 0.0
 
         if entity_id not in self._thermal_models or entity_id not in self._autotuners or entity_id not in self._pids:
             _LOGGER.warning(
                 "Unknown zone entity '%s' not registered in thermal models, autotuners, or PIDs. Unable to calculate demand.",
                 entity_id,
+            )
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, entity_id, event="zone_control_skipped", reason="unregistered_zone",
+                current_temp=current_temp, target_temp=target_temp, demand=0.0, demand_updated=False,
             )
             return 0.0
 
@@ -191,9 +208,14 @@ class ZoneController:
                     entity_id,
                 )
                 self.coordinator.demand_aggregator.set_zone_demand(entity_id, demand)
+                telemetry.get_recorder().record(
+                    telemetry.KIND_EVENT, entity_id, event="zone_control_skipped", reason="critical_sensor_fault",
+                    current_temp=current_temp, target_temp=target_temp, demand=demand, demand_updated=True,
+                )
                 return 0.0
 
             is_dhw = bool(getattr(self.coordinator, "is_dhw_active", False))
+            was_dhw = self._was_dhw_active
             if self._was_dhw_active and not is_dhw:
                 _LOGGER.info(
                     "Domestic Hot Water (DHW) production ended: resetting PID integrals, dt and timestamps for all zones."
@@ -201,6 +223,11 @@ class ZoneController:
                 for p in self._pids.values():
                     p.clear_samples()
             self._was_dhw_active = is_dhw
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, entity_id, event="zone_dhw", active=is_dhw,
+                previously_active=was_dhw, reset_all=was_dhw and not is_dhw,
+                pid_frozen=is_dhw,
+            )
 
             if is_dhw:
                 _LOGGER.debug(
@@ -209,7 +236,11 @@ class ZoneController:
                 )
                 if entity_id in self._pids:
                     self._pids[entity_id].clear_samples()
-                return self.coordinator.demand_aggregator.get_zone_demand(entity_id)
+                held_demand = self.coordinator.demand_aggregator.get_zone_demand(entity_id)
+                telemetry.get_recorder().record(
+                    telemetry.KIND_EVENT, entity_id, event="zone_dhw_held_demand", demand=held_demand,
+                )
+                return held_demand
 
             # Smart Stop: Calculate Effective Target based on learned Inertia
             thermal_model = self._thermal_models[entity_id]
@@ -234,7 +265,7 @@ class ZoneController:
                 telemetry.get_recorder().record(
                     telemetry.KIND_EVENT, entity_id, event="hysteresis_demand", input=current_temp,
                     effective_target=effective_target, tolerance=tolerance, demand=demand,
-                    autotune_state=str(tuner.state),
+                    previous_demand=current_demand, autotune_state=str(tuner.state),
                 )
             else:
                 # Smart PID Mode
@@ -247,11 +278,19 @@ class ZoneController:
                 )
 
                 # Apply Weather Compensation (Feed Forward)
+                pid_demand = demand
+                raw_curve = None
                 try:
-                    curve_val = float(self.coordinator.get_persistent_data(KEY_WEATHER_CURVE, 0.0) or 0.0)
+                    raw_curve = self.coordinator.get_persistent_data(KEY_WEATHER_CURVE, 0.0)
+                    curve_val = float(raw_curve or 0.0)
                 except (ValueError, TypeError):
                     curve_val = 0.0
-                if self.coordinator.weather_sensor_id:
+                manual_curve = curve_val
+                outdoor_temp = None
+                ff_demand = 0.0
+                weather_applied = False
+                weather_sensor_id = self.coordinator.weather_sensor_id
+                if weather_sensor_id:
                     outdoor_temp = self._outdoor_temp()
                     if outdoor_temp is not None:
                         # Adaptive Curve Calculation (SAT Math)
@@ -260,6 +299,7 @@ class ZoneController:
                         # (Target - OutdoorTemp) * Ke
                         delta_t = effective_target - outdoor_temp
                         if delta_t > 0.0 and curve_val > 0.0:
+                            weather_applied = True
                             ff_demand = delta_t * curve_val
                             # Clamp the weather bonus to a max of +40% to avoid it dominating the PID
                             ff_demand = min(40.0, ff_demand)
@@ -282,10 +322,24 @@ class ZoneController:
                                 ff_demand,
                                 demand,
                             )
+                telemetry.get_recorder().record(
+                    telemetry.KIND_EVENT, entity_id, event="weather_compensation",
+                    pid_demand=pid_demand, current_temp=current_temp, effective_target=effective_target,
+                    weather_sensor=weather_sensor_id, outdoor_temp=outdoor_temp,
+                    raw_curve=raw_curve if raw_curve is None or isinstance(raw_curve, (str, bool, int, float)) else None,
+                    raw_curve_captured=raw_curve is None or isinstance(raw_curve, (str, bool, int, float)),
+                    manual_curve=manual_curve, effective_curve=curve_val,
+                    applied=weather_applied, feed_forward=ff_demand, demand=demand,
+                )
         else:
             demand = 0.0
 
         self.coordinator.demand_aggregator.set_zone_demand(entity_id, demand)
+        if hvac_mode != HVAC_MODE_HEAT or zone_mode == ZONE_MODE_BYPASS:
+            telemetry.get_recorder().record(
+                telemetry.KIND_EVENT, entity_id, event="zone_control_skipped", reason="inactive_mode",
+                hvac_mode=hvac_mode, zone_mode=zone_mode, demand=demand, demand_updated=True,
+            )
 
         tuner = self._autotuners[entity_id]
         if not learn:

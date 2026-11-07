@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import copy
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 import inspect
 import logging
 from typing import Any
+from uuid import uuid4
 
 from homeassistant.components.climate.const import HVACMode
 import homeassistant.util.dt as dt_util
@@ -28,6 +30,7 @@ from .const import (
     ZONE_MODE_BYPASS,
     make_zone_entity_id,
 )
+from . import telemetry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +71,10 @@ class ScheduleProfileManager:
         self.schedule_overrides: dict[str, float] = {}
         self.smart_start_info: dict[str, dict[str, Any]] = {}
         self.smart_return: dict[str, Any] | None = None
+        self._replay_evaluation_id = ContextVar("schedule_replay_evaluation_id", default=None)
+        self._schedule_replay_epoch = uuid4().hex
+        self._schedule_replay_step = 0
+        self._manual_replay_step = 0
 
     @property
     def hass(self):
@@ -129,6 +136,24 @@ class ScheduleProfileManager:
         saved_sr = self.coordinator.get_persistent_data(KEY_SMART_RETURN, None)
         self.smart_return = dict(saved_sr) if isinstance(saved_sr, dict) else None
 
+    def record_schedule_state(self, source: str) -> None:
+        """Snapshot scheduler inputs without retaining mutable references."""
+        recorder = telemetry.get_recorder()
+        if not recorder.enabled:
+            return
+        try:
+            snapshot = copy.deepcopy({
+                "enabled": self.scheduler_enabled, "active_profile": self.active_profile,
+                "expires_at": self.profile_expires_at, "fallback_profile": self.fallback_profile,
+                "profiles": self.profiles, "manual_overrides": self.manual_overrides,
+                "smart_return": self.smart_return, "schedule_overrides": self.schedule_overrides,
+                "smart_start_info": self.smart_start_info,
+            })
+            recorder.record(telemetry.KIND_CONFIG, None, source=source, schedule=snapshot,
+                            evaluation_epoch=self._schedule_replay_epoch)
+        except Exception:
+            _LOGGER.exception("Unable to capture scheduler telemetry")
+
     async def async_save_to_storage(self) -> None:
         """Persist schedule state into coordinator settings store."""
         if hasattr(self.coordinator, "_settings") and isinstance(self.coordinator._settings, dict):
@@ -141,6 +166,7 @@ class ScheduleProfileManager:
             self.coordinator._settings[KEY_SMART_RETURN] = self.smart_return
             if hasattr(self.coordinator, "_settings_store") and self.coordinator._settings_store:
                 await self.coordinator._settings_store.async_save(self.coordinator._settings)
+                self.record_schedule_state("schedule_saved")
 
     async def async_set_scheduler_enabled(
         self, enabled: bool, now: datetime | None = None
@@ -352,16 +378,23 @@ class ScheduleProfileManager:
 
         plan: dict[str, dict[str, Any]] = {}
         all_zones = getattr(self.coordinator, "zones", [])
+        recorder = telemetry.get_recorder()
+        observed_zones = [] if recorder.enabled else None
 
         for zone in all_zones:
             zone_name = zone.get(CONF_ZONE_NAME, "")
             climate_id = zone.get("climate_id") or make_zone_entity_id(zone_name)
+            observed = {"name": zone_name, "id": climate_id, "selected": False} if observed_zones is not None else None
+            if observed is not None:
+                observed_zones.append(observed)
             if norm_filter and climate_id not in norm_filter:
                 continue
 
             current_temp = self._get_zone_current_temp(climate_id)
             target_temp = self._resolve_preset_temp(preset, climate_id)
             heating_rate = self._get_zone_heating_rate(climate_id)
+            if observed is not None:
+                observed.update(selected=True, temperature=current_temp, target=target_temp, heating_rate=heating_rate)
 
             if current_temp is not None and current_temp < target_temp:
                 hours_needed = min(
@@ -385,6 +418,17 @@ class ScheduleProfileManager:
                 ),
             }
 
+        if observed_zones is not None:
+            try:
+                recorder.record(
+                    telemetry.KIND_EVENT, None, event="smart_return_plan",
+                    now=now.isoformat(), arrival=arrival_time, arrival_is_datetime=isinstance(arrival_time, datetime),
+                    preset=preset, zones=copy.deepcopy(zones), inputs=copy.deepcopy(observed_zones),
+                    evaluation_id=self._replay_evaluation_id.get(),
+                    plan=copy.deepcopy(plan),
+                )
+            except Exception:
+                _LOGGER.exception("Unable to capture smart-return plan for replay")
         return plan
 
     async def async_set_smart_return(
@@ -584,25 +628,64 @@ class ScheduleProfileManager:
         """Record manual override for zone lasting until current slot changes/expires."""
         if now is None:
             now = dt_util.now()
+        capture = self._start_manual_override_capture()
         slot = self.evaluate_zone_slot(climate_id, now)
         until_dt = slot["until"]
         until_str = until_dt.isoformat() if isinstance(until_dt, datetime) else str(until_dt)
+        effective_target = float(target_temp)
+        slot_id = slot["slot_id"]
+        created_at = now.isoformat()
         self.manual_overrides[climate_id] = {
-            "target_temp": float(target_temp),
-            "slot_id": slot["slot_id"],
+            "target_temp": effective_target,
+            "slot_id": slot_id,
             "until": until_str,
-            "created_at": now.isoformat(),
+            "created_at": created_at,
         }
         self.schedule_overrides[climate_id] = float(target_temp)
+        self._finish_manual_override_capture(capture, "set", climate_id, {
+            "target_temp": effective_target, "slot_id": slot_id, "until": until_str, "now": created_at,
+        })
+
+    def _start_manual_override_capture(self):
+        step = self._manual_replay_step
+        self._manual_replay_step += 1
+        recorder = telemetry.get_recorder()
+        if not recorder.enabled:
+            return None
+        try:
+            return recorder, step, copy.deepcopy({
+                "manual_overrides": self.manual_overrides, "schedule_overrides": self.schedule_overrides,
+            })
+        except Exception:
+            _LOGGER.exception("Unable to capture manual override telemetry")
+            return None
+
+    def _finish_manual_override_capture(self, capture, action, climate_id, inputs=None):
+        if capture is None:
+            return
+        recorder, step, before = capture
+        try:
+            after = copy.deepcopy({
+                "manual_overrides": self.manual_overrides, "schedule_overrides": self.schedule_overrides,
+            })
+            recorder.record(
+                telemetry.KIND_EVENT, None, event="schedule_manual_override", action=action,
+                climate_id=climate_id, evaluation_epoch=self._schedule_replay_epoch,
+                override_step=step, before=before, after=after, inputs=copy.deepcopy(inputs),
+            )
+        except Exception:
+            _LOGGER.exception("Unable to capture manual override telemetry")
 
     def clear_manual_override(
         self, climate_id: str | None = None, now: datetime | None = None
     ):
         """Clear manual override and re-evaluate schedule immediately."""
+        capture = self._start_manual_override_capture()
         if climate_id is None:
             self.manual_overrides.clear()
         else:
             self.manual_overrides.pop(climate_id, None)
+        self._finish_manual_override_capture(capture, "clear", climate_id)
         coro = self.async_evaluate_schedule(now)
         if hasattr(self.hass, "async_create_task"):
             return self.hass.async_create_task(coro)
@@ -612,10 +695,12 @@ class ScheduleProfileManager:
         self, climate_id: str | None = None, now: datetime | None = None
     ) -> None:
         """Async version to clear manual override and re-evaluate schedule."""
+        capture = self._start_manual_override_capture()
         if climate_id is None:
             self.manual_overrides.clear()
         else:
             self.manual_overrides.pop(climate_id, None)
+        self._finish_manual_override_capture(capture, "clear", climate_id)
         await self.async_evaluate_schedule(now)
         self._notify_climates()
 
@@ -673,6 +758,51 @@ class ScheduleProfileManager:
         if now is None:
             now = dt_util.now()
 
+        recorder = telemetry.get_recorder()
+        evaluation = None
+        evaluation_id = None
+        evaluation_step = self._schedule_replay_step
+        self._schedule_replay_step += 1
+        if recorder.enabled:
+            try:
+                evaluation_id = uuid4().hex
+                evaluation = {
+                    "before": copy.deepcopy({
+                        "enabled": self.scheduler_enabled, "active_profile": self.active_profile,
+                        "expires_at": self.profile_expires_at, "fallback_profile": self.fallback_profile,
+                        "manual_overrides": self.manual_overrides, "smart_return": self.smart_return,
+                        "schedule_overrides": self.schedule_overrides, "smart_start_info": self.smart_start_info,
+                    }),
+                    "zones": [], "smart_return_actions": [], "completion_zones": [],
+                }
+                recorder.record(
+                    telemetry.KIND_EVENT, None, event="schedule_evaluation_start",
+                    evaluation_id=evaluation_id, evaluation_epoch=self._schedule_replay_epoch,
+                    evaluation_step=evaluation_step, now=now.isoformat(), before=evaluation["before"],
+                )
+            except Exception:
+                _LOGGER.exception("Unable to capture schedule evaluation inputs")
+
+        def record_evaluation(reason, profile_expired, smart_return_completed):
+            if evaluation is None:
+                return
+            try:
+                recorder.record(
+                    telemetry.KIND_EVENT, None, event="schedule_evaluation", now=now.isoformat(),
+                    evaluation_id=evaluation_id, evaluation_epoch=self._schedule_replay_epoch,
+                    evaluation_step=evaluation_step,
+                    reason=reason, profile_expired=profile_expired,
+                    smart_return_completed=smart_return_completed,
+                    **copy.deepcopy(evaluation), after=copy.deepcopy({
+                        "enabled": self.scheduler_enabled, "active_profile": self.active_profile,
+                        "expires_at": self.profile_expires_at, "fallback_profile": self.fallback_profile,
+                        "manual_overrides": self.manual_overrides, "smart_return": self.smart_return,
+                        "schedule_overrides": self.schedule_overrides, "smart_start_info": self.smart_start_info,
+                    }),
+                )
+            except Exception:
+                _LOGGER.exception("Unable to capture schedule evaluation output")
+
         profile_expired = self.check_profile_expiry(now)
         if profile_expired:
             await self.async_save_to_storage()
@@ -700,22 +830,33 @@ class ScheduleProfileManager:
                     sr_zones = self.smart_return.get("zones")
 
                     # Wake up master if disabled
+                    if evaluation is not None:
+                        evaluation["smart_return_actions"].append({"action": "wake_master"})
                     await self._async_wake_master()
 
                     # Ensure plan zones are in HVACMode.HEAT
                     all_zones_list = getattr(self.coordinator, "zones", [])
                     for z in all_zones_list:
                         cid = z.get("climate_id") or make_zone_entity_id(z.get(CONF_ZONE_NAME, ""))
+                        completion_zone = {"id": cid} if evaluation is not None else None
+                        if completion_zone is not None:
+                            evaluation["completion_zones"].append(completion_zone)
                         if sr_zones is None or cid in sr_zones:
                             z_mode = None
                             if hasattr(self.coordinator, "get_zone_mode"):
                                 z_mode = self.coordinator.get_zone_mode(cid)
                             elif hasattr(self.coordinator, "zone_manager") and hasattr(self.coordinator.zone_manager, "get_zone_mode"):
                                 z_mode = self.coordinator.zone_manager.get_zone_mode(cid)
+                            if completion_zone is not None:
+                                completion_zone["mode"] = z_mode
                             if z_mode != ZONE_MODE_BYPASS:
+                                if evaluation is not None:
+                                    evaluation["smart_return_actions"].append({"action": "wake_zone", "id": cid})
                                 await self._async_wake_zone(cid)
 
                     if not self.scheduler_enabled and hasattr(self.coordinator, "zone_manager"):
+                        if evaluation is not None:
+                            evaluation["smart_return_actions"].append({"action": "set_preset", "preset": sr_preset})
                         await self.coordinator.zone_manager.async_set_global_preset(sr_preset)
                     self.smart_return = None
                     await self.async_save_to_storage()
@@ -729,7 +870,10 @@ class ScheduleProfileManager:
             if self.schedule_overrides or self.smart_start_info:
                 self.schedule_overrides.clear()
                 self.smart_start_info.clear()
+                record_evaluation("disabled", profile_expired, smart_return_completed)
                 self._notify_climates()
+            else:
+                record_evaluation("disabled", profile_expired, smart_return_completed)
             return
 
         old_overrides = dict(self.schedule_overrides)
@@ -742,7 +886,13 @@ class ScheduleProfileManager:
             sr_arrival = self.smart_return["arrival_time"]
             sr_preset = self.smart_return.get("preset", "comfort")
             sr_zones = self.smart_return.get("zones")
-            sr_plan = self.calculate_smart_return_plan(sr_arrival, sr_preset, sr_zones, now)
+            token = self._replay_evaluation_id.set(evaluation_id)
+            try:
+                sr_plan = self.calculate_smart_return_plan(sr_arrival, sr_preset, sr_zones, now)
+            finally:
+                self._replay_evaluation_id.reset(token)
+        if evaluation is not None:
+            evaluation["smart_return_plan"] = sr_plan
 
         zones = getattr(self.coordinator, "zones", [])
 
@@ -764,6 +914,9 @@ class ScheduleProfileManager:
                 st = self.hass.states.get(climate_id)
                 if st is not None and st.state in (HVACMode.OFF, "off"):
                     is_off = True
+            zone_observation = {"id": climate_id, "initially_off": is_off} if evaluation is not None else None
+            if zone_observation is not None:
+                evaluation["zones"].append(zone_observation)
 
             # 1. Smart Return check for zone:
             # If Smart Return ignition time has arrived, Smart Return wakes up Master and turns the zone to HEAT
@@ -792,8 +945,12 @@ class ScheduleProfileManager:
 
                         if z_mode != ZONE_MODE_BYPASS:
                             # Wake up master and zone if off
+                            if evaluation is not None:
+                                evaluation["smart_return_actions"].append({"action": "wake_master"})
                             await self._async_wake_master()
                             if is_off:
+                                if evaluation is not None:
+                                    evaluation["smart_return_actions"].append({"action": "wake_zone", "id": climate_id})
                                 await self._async_wake_zone(climate_id, climate_ent)
                                 is_off = False
 
@@ -807,18 +964,27 @@ class ScheduleProfileManager:
                                 "heating_rate": item["heating_rate"],
                                 "source": "smart_return",
                             }
+                            if zone_observation is not None:
+                                zone_observation["decision"] = "smart_return"
+                                zone_observation["mode"] = z_mode
                             continue
+                        if zone_observation is not None:
+                            zone_observation["mode"] = z_mode
 
             # 2. Explicit OFF check:
             # If zone is in HVACMode.OFF (and not currently firing a Smart Return ignition),
             # strictly preserve Explicit OFF - do not force turning on and drop overrides.
             if is_off:
+                if zone_observation is not None:
+                    zone_observation["decision"] = "off"
                 self.manual_overrides.pop(climate_id, None)
                 self.schedule_overrides.pop(climate_id, None)
                 continue
 
             # 3. Manual override check (only when scheduler is enabled)
             slot = self.evaluate_zone_slot(climate_id, now)
+            if zone_observation is not None:
+                zone_observation["slot"] = slot
             has_valid_manual_override = False
             if self.scheduler_enabled and climate_id in self.manual_overrides:
                 ov = self.manual_overrides[climate_id]
@@ -849,28 +1015,40 @@ class ScheduleProfileManager:
                     has_valid_manual_override = True
 
             if has_valid_manual_override:
+                if zone_observation is not None:
+                    zone_observation["decision"] = "manual_override"
                 continue
 
             # 4. Smart Return waiting check:
             # If zone is in sr_plan but ignition time has not arrived yet, and scheduler is disabled, do not apply overrides
             if climate_id in sr_plan:
                 if not self.scheduler_enabled:
+                    if zone_observation is not None:
+                        zone_observation["decision"] = "smart_return_wait"
                     self.schedule_overrides.pop(climate_id, None)
                     continue
 
             # 5. Weekly scheduler baseline & Predictive Smart Start
             if self.scheduler_enabled:
+                if zone_observation is not None:
+                    zone_observation["decision"] = "schedule"
                 self.schedule_overrides[climate_id] = float(slot["target_temp"])
 
                 # Check predictive smart start for upcoming block
                 upcoming = self.get_upcoming_blocks(climate_id, now, horizon_hours=12)
                 future_blocks = [b for b in upcoming if b["start_dt"] > now]
+                if zone_observation is not None:
+                    zone_observation["upcoming"] = upcoming
                 if future_blocks:
                     next_b = future_blocks[0]
                     if next_b["target_temp"] > slot["target_temp"]:
                         curr_temp = self._get_zone_current_temp(climate_id)
+                        if zone_observation is not None:
+                            zone_observation["temperature"] = curr_temp
                         if curr_temp is not None and curr_temp < next_b["target_temp"]:
                             heating_rate = self._get_zone_heating_rate(climate_id)
+                            if zone_observation is not None:
+                                zone_observation["heating_rate"] = heating_rate
                             hours_needed = min(
                                 MAX_SMART_START_HOURS,
                                 (next_b["target_temp"] - curr_temp) / heating_rate,
@@ -895,6 +1073,7 @@ class ScheduleProfileManager:
 
         target_changed = old_overrides != self.schedule_overrides
         smart_start_changed = old_smart_start != self.smart_start_info
+        record_evaluation("evaluated", profile_expired, smart_return_completed)
         if target_changed or smart_start_changed or profile_expired or smart_return_completed:
             self._notify_climates()
 

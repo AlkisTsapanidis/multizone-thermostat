@@ -51,10 +51,11 @@ class PlantOrchestrator:
                     break
 
         # Hard stop if master switch is OFF
-        if not self.coordinator.get_master_state() and not frost_emergency:
+        master_on = self.coordinator.get_master_state()
+        if not master_on and not frost_emergency:
             telemetry.get_recorder().record(
                 telemetry.KIND_PLANT, "boiler", action="master_off", frost_emergency=False,
-                aggregation_evaluated=False,
+                master_on=master_on, aggregation_evaluated=False,
             )
             await self.boiler_backend.async_emergency_off()
             return
@@ -110,7 +111,7 @@ class PlantOrchestrator:
                 recorder.record(
                     telemetry.KIND_PLANT, "boiler", action="aggregate", aggregation_evaluated=True,
                     raw_demands=raw_demands, suppressed=suppressed,
-                    frost_emergency=frost_emergency, dhw_active=dhw_active,
+                    frost_emergency=frost_emergency, dhw_active=dhw_active, master_on=master_on,
                     demand=agg.demand, peak_zone=agg.peak_zone, strategy=getattr(agg, "strategy", None),
                     primary_demands=primary.copy() if isinstance(primary, dict) else None,
                     secondary_demands=secondary.copy() if isinstance(secondary, dict) else None,

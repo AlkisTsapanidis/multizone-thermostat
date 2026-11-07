@@ -4,10 +4,12 @@ from __future__ import annotations
 import logging
 import math
 import time
+from copy import deepcopy
 from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
+from .. import telemetry
 from .const import (
     ANOMALY_NONE,
     ANOMALY_VALVE_STUCK_CLOSED,
@@ -151,9 +153,28 @@ def get_opentherm_diagnostics(coordinator: Any, hass: HomeAssistant) -> dict[str
         "dhw_active": False,
         "condensing_optimal": None,
     }
+    recorder = telemetry.get_recorder()
+    observed = [] if recorder.enabled else None
 
     # 1. Inspect direct attributes of opentherm_entity
     st = hass.states.get(ot_entity)
+    if observed is not None:
+        try:
+            attributes = getattr(st, "attributes", None)
+            keys = (
+                "current_temperature", "flow_temperature", "boiler_temperature", "ch_flow_temperature",
+                "return_temperature", "return_water_temperature", "ch_return_temperature",
+                "boiler_return_temperature", "pressure", "water_pressure", "ch_water_pressure",
+                "boiler_pressure", "modulation", "modulation_level", "relative_modulation_level",
+                "relative_mod_level", "flame", "flame_active", "flame_on", "flame_status", "hvac_action",
+                "fault", "fault_code", "oem_fault_code", "error_code", "fault_flags",
+                "dhw_active", "dhw_state", "dhw_mode", "hot_water_active",
+            )
+            raw = {key: attributes[key] for key in keys if attributes and key in attributes}
+            observed.append({"entity": ot_entity, "state": getattr(st, "state", None), "attributes": deepcopy(raw)})
+        except Exception:
+            _LOGGER.exception("Unable to capture OpenTherm diagnostic attributes")
+            observed.append({"entity": ot_entity, "capture_error": True})
     if st and st.attributes:
         attrs = st.attributes
         # Current / Flow temp
@@ -229,6 +250,16 @@ def get_opentherm_diagnostics(coordinator: Any, hass: HomeAssistant) -> dict[str
             for ent in er.async_entries_for_device(ent_reg, entry.device_id):
                 if ent.entity_id != ot_entity:
                     s_st = hass.states.get(ent.entity_id)
+                    if observed is not None:
+                        try:
+                            observed.append({
+                                "entity": ent.entity_id, "state": getattr(s_st, "state", None),
+                                "device_class": getattr(ent, "original_device_class", None)
+                                or getattr(ent, "device_class", None),
+                            })
+                        except Exception:
+                            _LOGGER.exception("Unable to capture OpenTherm companion sensor")
+                            observed.append({"entity": ent.entity_id, "capture_error": True})
                     if not s_st or s_st.state in ("unavailable", "unknown"):
                         continue
                     
@@ -275,6 +306,11 @@ def get_opentherm_diagnostics(coordinator: Any, hass: HomeAssistant) -> dict[str
     if result["return_temperature"] is not None:
         result["condensing_optimal"] = result["return_temperature"] < 54.0
 
+    if observed is not None:
+        recorder.record(
+            telemetry.KIND_SENSOR, "boiler", source="opentherm_diagnostics",
+            observed=observed, result=result.copy(),
+        )
     return result
 
 def evaluate_zone_anomalies(
