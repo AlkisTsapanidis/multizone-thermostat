@@ -67,6 +67,12 @@ CONF_ANTI_SEIZE_BOILER = "anti_seize_boiler_enable"
 CONF_WEATHER_SENSOR = "weather_sensor"
 KEY_WEATHER_CURVE = "weather_curve"
 
+# Diagnostics. Telemetry logging defaults on (bounded, see telemetry.py); debug sensors default off.
+CONF_TELEMETRY_ENABLED = "telemetry_enabled"
+CONF_DEBUG_SENSORS = "debug_sensors"
+DEFAULT_TELEMETRY_ENABLED = True
+DEFAULT_DEBUG_SENSORS = False
+
 
 # HVAC
 HVAC_MODE_HEAT = "heat"

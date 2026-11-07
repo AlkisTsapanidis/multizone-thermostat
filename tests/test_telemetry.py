@@ -45,16 +45,23 @@ def test_sequence_numbers_are_monotonic_and_gapless(tmp_path):
     assert seqs == list(range(1, 21))
 
 
-def test_non_finite_floats_stay_valid_json_and_are_flagged(tmp_path):
+def test_non_finite_floats_are_preserved_losslessly_and_strict_json(tmp_path):
     rec, _ = make(tmp_path)
-    rec.record("pid", "z", output=math.nan, nested={"x": math.inf}, ok=1.0)
+    rec.record("pid", "z", output=math.nan, nested={"x": math.inf, "y": [1.0, -math.inf]},
+               label="NaN", ok=1.0)
     rec.flush()
     (path,) = files(tmp_path)
     raw = open(path, encoding="utf-8").read()
-    assert "NaN" not in raw and "Infinity" not in raw
-    (record,) = [json.loads(line) for line in raw.splitlines()]
-    assert record["data"]["output"] is None and record["data"]["nested"]["x"] is None
-    assert len(record["nonfinite"]) == 2
+    # strict parsers must accept the file: no bare NaN/Infinity literals
+    json.loads(raw.splitlines()[0], parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    on_disk = json.loads(raw.splitlines()[0])
+    assert on_disk["data"]["output"] == "NaN" and on_disk["data"]["nested"]["x"] == "+Inf"
+    assert on_disk["nonfinite"] == {".output": "NaN", ".nested.x": "+Inf", ".nested.y[1]": "-Inf"}
+    (record,) = list(telemetry.read_records([path]))
+    d = record["data"]
+    assert math.isnan(d["output"]) and d["nested"]["x"] == math.inf
+    assert d["nested"]["y"] == [1.0, -math.inf]
+    assert d["label"] == "NaN"  # a real string is not turned into a float
 
 
 def test_unserialisable_values_never_raise(tmp_path):

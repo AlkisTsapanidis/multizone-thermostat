@@ -10,6 +10,8 @@ from homeassistant.helpers import selector
 from homeassistant import data_entry_flow
 
 from ..const import (
+    CONF_TELEMETRY_ENABLED,
+    CONF_DEBUG_SENSORS,
     CONF_BOILER_MODE,
     CONF_BOILER_SWITCH,
     CONF_GEOFENCING_ENABLED,
@@ -325,6 +327,13 @@ def get_options_edit_geofencing_schema(geofencing_enabled: bool, presence_sensor
         vol.Optional(CONF_PRESENCE_SENSOR, default=presence_sensor or "zone.home"): selector.EntitySelector(
             selector.EntitySelectorConfig(domain=["person", "group", "zone", "device_tracker", "binary_sensor", "input_boolean"])
         ),
+    })
+
+
+def get_options_edit_diagnostics_schema(telemetry_enabled: bool, debug_sensors: bool) -> vol.Schema:
+    return vol.Schema({
+        vol.Required(CONF_TELEMETRY_ENABLED, default=telemetry_enabled): bool,
+        vol.Required(CONF_DEBUG_SENSORS, default=debug_sensors): bool,
     })
 
 

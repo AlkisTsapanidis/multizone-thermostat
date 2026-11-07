@@ -99,6 +99,10 @@ from .const import (
     KEY_WEATHER_CURVE,
     KEY_DEMAND_STRATEGY,
     KEY_RATE_ESTIMATOR,
+    CONF_TELEMETRY_ENABLED,
+    CONF_DEBUG_SENSORS,
+    DEFAULT_TELEMETRY_ENABLED,
+    DEFAULT_DEBUG_SENSORS,
 )
 from .demand_aggregator import VALID_DEMAND_STRATEGIES
 from .rate_estimators import available_estimators
@@ -145,6 +149,8 @@ class MultizoneCoordinator:
         self.presence_sensor = config.get(CONF_PRESENCE_SENSOR)
         self.weather_sensor_id = config.get(CONF_WEATHER_SENSOR)
         self.global_calendar_id = config.get(CONF_GLOBAL_CALENDAR)
+        self.telemetry_enabled: bool = config.get(CONF_TELEMETRY_ENABLED, DEFAULT_TELEMETRY_ENABLED) is not False
+        self.debug_sensors: bool = config.get(CONF_DEBUG_SENSORS, DEFAULT_DEBUG_SENSORS) is True
         self.master_device_id: str | None = None
         
         # Internal state tracking
@@ -593,12 +599,18 @@ class MultizoneCoordinator:
 
 
     def _start_telemetry(self) -> None:
-        """Install the process-wide JSONL telemetry recorder and flush it off the event loop."""
+        """Install the process-wide JSONL telemetry recorder and flush it off the event loop.
+
+        With telemetry disabled but debug sensors on, the recorder still runs in memory (nothing is
+        written) so the sensors have data to show.
+        """
+        if not (self.telemetry_enabled or self.debug_sensors):
+            return
         try:
             directory = self.hass.config.path("mzt_telemetry")
             if not isinstance(directory, str):
                 return
-            self._telemetry = telemetry.JsonlRecorder(directory)
+            self._telemetry = telemetry.JsonlRecorder(directory, persist=self.telemetry_enabled)
             telemetry.set_recorder(self._telemetry)
             self._unsub_listeners.append(
                 async_track_time_interval(self.hass, self._async_flush_telemetry, timedelta(seconds=30))

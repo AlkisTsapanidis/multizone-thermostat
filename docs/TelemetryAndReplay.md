@@ -13,7 +13,7 @@ No numerical control code should change until the behaviour it replaces can be *
 | Buffering | `record()` only appends to a bounded in-memory deque (5000); never raises, never does I/O |
 | Flushing | every 30 s via the executor, and on unload |
 | Retention | 7 days, 150 MB total (oldest files removed first), 50 MB per file (then `.1`, `.2`...) |
-| Non-finite floats | written as `null`, original listed under `nonfinite` (files stay valid JSON) |
+| Non-finite floats | written as the strings `"NaN"`, `"+Inf"`, `"-Inf"`; the record carries `nonfinite: {path: token}` and `read_records` restores real floats at exactly those paths (files stay strict JSON, round trip is lossless) |
 | Torn lines | skipped by `read_records` (expected after a crash) |
 | Clocks | every record has `wall` (epoch s) **and** `mono` (monotonic s) |
 
@@ -78,6 +78,14 @@ code is known not to have.
 | SYNC-001 | `test_replay_sync.py` | one failing switch aborts the loop; later switches are never commanded |
 | SYNC-002 | same | a service-call exception escapes the 10 s PWM tick |
 | SYNC-003 | same | valve switches use a private 0/0 PWM: 120 valve commands/hour on demand flutter |
+| PLANT-001 | `test_plant_closed_loop.py` | at 10-25 % demand the 5 min boiler min-on outlasts the valve open window: boiler fires into a closed valve (~74-89 % of its on-time in the simulation) |
+| PLANT-002 | same | at 80 % demand boiler PWM and valve PWM are unsynchronised (~21 % of on-time into a closed valve) |
+| PLANT-003 | same | 90 s valve actuation latency leaves the boiler firing while the valve is closed (~25 % of on-time) |
+
+PLANT results come from `tests/mzt_replay/plant_sim.py`: real `ZoneSyncManager` valves and real
+`RelayBoilerBackend` on a manual clock with fake switches (optional latency). Caveat: the simulation
+replaces `PlantOrchestrator` with a minimal tick loop and does not run the delayed valve-open task, so
+`valve_delay > 0` is not covered yet. Treat the percentages as indicative until validated on real logs.
 
 Characterisation tests (green, named `test_characterisation_*` or documented in the docstring) pin
 behaviour that is questionable but deliberate, e.g. integral discarded on a >=1.5 degC setpoint step
@@ -90,12 +98,51 @@ behaviour that is questionable but deliberate, e.g. integral discarded on a >=1.
 3. The test now XPASSes (strict) and the run fails: remove the `known_defect` marker.
 4. Re-run replay on real logs/samples before and after; compare, then commit.
 
-## 4. Gaps still to close
+## 4. CSV export and summary CLI
 
-* Boiler-on-into-closed-valves (system level): needs a closed-loop harness wiring `DemandAggregator`,
-  `RelayBoilerBackend` and fake valves with latency and faults.
-* Replay of `pid` records from real logs (the log has everything needed; a driver is not written yet).
-* Log viewer CLI (summary, PWM transitions per hour, estimator vs. reference plots).
-* Instrumentation for the items listed under section 1.
+```
+python scripts/mzt_log.py csv  <dir-or-files> -o out.csv [--kind pid] [--zone NAME]
+python scripts/mzt_log.py summary <dir-or-files>
+```
+
+Implemented in `telemetry_export.py` (`export_csv`, `summarize`). Non-finite values appear as `NaN`,
+`+Inf`, `-Inf` in the CSV as well.
+
+## 5. Diagnostics options and debug sensors
+
+Options -> Diagnostics has two switches:
+
+* `telemetry_enabled` (default **on**): write the rolling JSONL log.
+* `debug_sensors` (default **off**): create diagnostic sensor entities (PID, estimator and valve PWM
+  per zone, plus a boiler sensor) that show the latest record as attributes. They are excluded from
+  the HA recorder, refresh every 10 s and publish NaN/Inf as strings. If telemetry is disabled but
+  debug sensors are on, an in-memory recorder (`persist=False`) feeds the sensors and nothing is written
+  to disk.
+
+## 6. PID replay and the frozen reference
+
+`replay_pid_from_records(records, zone, module=None)` re-runs logged `pid` records through a PID
+class. Replay is exact from a clean-state boundary (a record whose `last_input_time` is None); dead
+sensor records are skipped; gains, limits and mode come from each record.
+`tests/mzt_replay/reference/pid_v0.py` is a frozen copy of the current (defective) PID. Differential
+tests in `test_replay_pid_records.py` prove production == reference on defect-free domains (Kd=0 with
+sane dt, smooth signals, OFF mode, mid-stream parameter changes). A deliberate fix may diverge only
+where the PID-001/002/005 known-defect tests apply. No refactor of the PID was needed.
+
+## 7. Gaps still to close
+
+* `valve_delay` / delayed-check path in the closed-loop plant harness; valve closing while boiler ON
+  with the real `PlantOrchestrator`.
+* Instrumentation of OpenTherm backend, proportional valves, `DemandAggregator`, frost/anti-seize,
+  DHW override and raw sensor events (a `sensor` record kind).
+* Replay of estimator records from real logs through the frozen reference (estimators only replay
+  synthetic data today).
+* Config: `options_flow._save_options` rebuilds entry data from a fixed key list, so unlisted keys
+  (e.g. a hand-set `rate_estimator`) look likely to be dropped on every options save. Unverified.
+* Translations for the Diagnostics step are English placeholders in de/es/fr/it/ru.
 * Time-base unification (`time.monotonic()` vs wall clock) so recorded wall time can drive replay of
   components that currently read only the monotonic clock.
+* The older review documents (`AdversarialCodeReview.md`, `REMEDIATION_PLAN.md`,
+  `EXECUTIVE_SUMMARY.md`) predate the observability-first priority order and the sync finding there is
+  partly wrong (`_local_pwm_state` is level-triggered); `ObservabilityTestabilityPlan.md` is the
+  authoritative ordering.

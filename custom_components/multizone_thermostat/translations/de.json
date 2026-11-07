@@ -146,6 +146,14 @@
                     "boiler_mode": "Kesselsteuermodus"
                 }
             },
+            "edit_diagnostics": {
+                "title": "Diagnostics",
+                "description": "Telemetry writes a bounded rolling log of every control decision to `<config>/mzt_telemetry` for offline replay (see docs/TelemetryAndReplay.md). Debug sensors expose the latest values as extra entities and are intended for troubleshooting only.",
+                "data": {
+                    "telemetry_enabled": "Write telemetry log files",
+                    "debug_sensors": "Create debug sensor entities (troubleshooting only)"
+                }
+            },
             "edit_calendar": {
                 "title": "Globaler Kalender",
                 "description": "Wählen Sie eine lokale Kalender-Entität, um den Zeitplan des Multizonen-Systems zu steuern.",

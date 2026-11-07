@@ -19,3 +19,15 @@ def load_prod_module(name: str) -> ModuleType:
     sys.modules[key] = module
     spec.loader.exec_module(module)
     return module
+
+
+def load_reference_module(name: str) -> ModuleType:
+    """Load a frozen pre-fix copy from tests/mzt_replay/reference/<name>.py (never edited)."""
+    key = f"_mzt_ref_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, Path(__file__).resolve().parent / "reference" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    spec.loader.exec_module(module)
+    return module

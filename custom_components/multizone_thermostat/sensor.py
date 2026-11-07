@@ -53,6 +53,12 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
+    if getattr(coordinator, "debug_sensors", False) is True:
+        from .debug_sensors import build_debug_sensors
+        async_add_entities(build_debug_sensors(
+            hass, config_entry.entry_id, coordinator,
+            [(z.get(CONF_ZONE_NAME, ""), make_zone_entity_id(z[CONF_ZONE_NAME])) for z in zones],
+        ))
 class DemandSensor(SensorEntity):
     """Sensor that reports the PID heating demand (0-100%)."""
 

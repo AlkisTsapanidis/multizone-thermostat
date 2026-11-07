@@ -40,6 +40,8 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
         self._presence_sensor: str | None = None
         self._weather_sensor: str | None = None
         self._global_calendar: str | None = None
+        self._telemetry_enabled: bool = DEFAULT_TELEMETRY_ENABLED
+        self._debug_sensors: bool = DEFAULT_DEBUG_SENSORS
         self._current_zone_name: str | None = None
         self._current_zone_data: dict[str, Any] | None = None
 
@@ -60,6 +62,8 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
             self._presence_sensor = cfg.get(CONF_PRESENCE_SENSOR)
             self._weather_sensor = cfg.get(CONF_WEATHER_SENSOR)
             self._global_calendar = cfg.get(CONF_GLOBAL_CALENDAR)
+            self._telemetry_enabled = cfg.get(CONF_TELEMETRY_ENABLED, DEFAULT_TELEMETRY_ENABLED)
+            self._debug_sensors = cfg.get(CONF_DEBUG_SENSORS, DEFAULT_DEBUG_SENSORS)
         if user_input is not None:
             action = user_input.get("action")
             if action == "change_boiler":
@@ -76,6 +80,8 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
                 return await self.async_step_edit_weather_comp()
             elif action == "edit_calendar":
                 return await self.async_step_edit_calendar()
+            elif action == "edit_diagnostics":
+                return await self.async_step_edit_diagnostics()
 
         menu_options = {
             "change_boiler": "Change boiler mode",
@@ -85,6 +91,7 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
             "edit_weather_comp": "Edit Weather Compensation",
             "edit_geofencing": "Edit Geofencing Settings",
             "edit_calendar": "Edit Global Calendar",
+            "edit_diagnostics": "Diagnostics (telemetry log, debug sensors)",
         }
 
         schema = get_options_init_schema(menu_options)
@@ -423,6 +430,20 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
             data_schema=schema,
         )
 
+    async def async_step_edit_diagnostics(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.FlowResult:
+        """Edit telemetry logging and debug sensor settings."""
+        if user_input is not None:
+            self._telemetry_enabled = user_input.get(CONF_TELEMETRY_ENABLED, DEFAULT_TELEMETRY_ENABLED)
+            self._debug_sensors = user_input.get(CONF_DEBUG_SENSORS, DEFAULT_DEBUG_SENSORS)
+            return self._save_options()
+
+        return self.async_show_form(
+            step_id="edit_diagnostics",
+            data_schema=get_options_edit_diagnostics_schema(self._telemetry_enabled, self._debug_sensors),
+        )
+
     def _save_options(self) -> config_entries.FlowResult:
         """Save updated options into entry.data and reload entry."""
         if self._boiler_mode == MODE_RELAY:
@@ -452,6 +473,8 @@ class MultizoneOptionsFlow(config_entries.OptionsFlow):
         if self._global_calendar:
             data[CONF_GLOBAL_CALENDAR] = self._global_calendar
 
+        data[CONF_TELEMETRY_ENABLED] = self._telemetry_enabled
+        data[CONF_DEBUG_SENSORS] = self._debug_sensors
         self.hass.config_entries.async_update_entry(
             self.config_entry, data=data
         )

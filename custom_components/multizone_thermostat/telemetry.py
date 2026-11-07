@@ -9,7 +9,10 @@ Design rules:
 * Every record carries both clocks (`wall` epoch seconds and `mono` monotonic seconds) because the
   integration mixes them; replay needs to know which one each component used.
 * Files are JSON Lines, one record per line, schema version in every record (`v`).
-* Non-finite floats are written as null with the original under `nonfinite`, keeping files valid JSON.
+* Non-finite floats are written in place as the strings "NaN", "+Inf" or "-Inf" (strict JSON stays
+  valid for other tools) and the record gains `nonfinite: {path: token}`. `read_records` restores the
+  real floats at exactly those paths, so replay sees the original NaN/inf and a genuine string
+  "NaN" is never confused with one.
 """
 from __future__ import annotations
 
@@ -37,9 +40,27 @@ KIND_BOILER = "boiler"          # boiler backend decision and reason
 KIND_EVENT = "event"            # free-form notable event (anomaly, restart, config change)
 
 
+_NONFINITE_TOKENS = {"NaN": math.nan, "+Inf": math.inf, "-Inf": -math.inf}
+
+
+def _token(value: float) -> str:
+    return "NaN" if math.isnan(value) else ("+Inf" if value > 0 else "-Inf")
+
+
+def _restore(value: Any, nonfinite: dict[str, str], path: str = "") -> Any:
+    """Turn the tokens written by `_sanitize` back into floats at exactly the flagged paths."""
+    if path in nonfinite and isinstance(value, str) and value in _NONFINITE_TOKENS:
+        return _NONFINITE_TOKENS[value]
+    if isinstance(value, dict):
+        return {k: _restore(v, nonfinite, f"{path}.{k}") for k, v in value.items()}
+    if isinstance(value, list):
+        return [_restore(v, nonfinite, f"{path}[{i}]") for i, v in enumerate(value)]
+    return value
+
+
 def _sanitize(value: Any) -> Any:
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        return value if math.isfinite(value) else _token(value)
     if isinstance(value, dict):
         return {str(k): _sanitize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -51,16 +72,16 @@ def _sanitize(value: Any) -> Any:
     return repr(value)
 
 
-def _find_nonfinite(value: Any, path: str = "") -> list[str]:
+def _find_nonfinite(value: Any, path: str = "") -> dict[str, str]:
     if isinstance(value, float) and not math.isfinite(value):
-        return [f"{path or '.'}={value!r}"]
-    found: list[str] = []
+        return {path: _token(value)}
+    found: dict[str, str] = {}
     if isinstance(value, dict):
         for k, v in value.items():
-            found += _find_nonfinite(v, f"{path}.{k}")
+            found.update(_find_nonfinite(v, f"{path}.{k}"))
     elif isinstance(value, (list, tuple)):
         for i, v in enumerate(value):
-            found += _find_nonfinite(v, f"{path}[{i}]")
+            found.update(_find_nonfinite(v, f"{path}[{i}]"))
     return found
 
 
@@ -74,6 +95,9 @@ class NullRecorder:
 
     def flush(self) -> int:
         return 0
+
+    def latest(self, zone: str | None, kind: str) -> dict[str, Any] | None:
+        return None
 
 
 class JsonlRecorder:
@@ -92,8 +116,11 @@ class JsonlRecorder:
         max_total_bytes: int = 150 * 1024 * 1024,
         retention_days: int = 7,
         prefix: str = "mzt",
+        persist: bool = True,
     ) -> None:
         self.directory = directory
+        self.persist = persist  # False: keep only the in-memory `latest` view (debug sensors), write nothing
+        self._latest: dict[tuple[str | None, str], dict[str, Any]] = {}
         self._wall = wall_clock
         self._mono = mono_clock
         self._buffer: deque[dict[str, Any]] = deque()
@@ -124,9 +151,14 @@ class JsonlRecorder:
                 if len(self._buffer) >= self._max_buffer:
                     self._buffer.popleft()
                     self.dropped += 1
+                self._latest[(zone, kind)] = rec
                 self._buffer.append(rec)
         except Exception:  # pragma: no cover - defensive, recording must not break control
             self.dropped += 1
+
+    def latest(self, zone: str | None, kind: str) -> dict[str, Any] | None:
+        """Most recent record queued for (zone, kind), regardless of whether it was flushed."""
+        return self._latest.get((zone, kind))
 
     def _path_for(self, wall: float, part: int) -> str:
         day = datetime.fromtimestamp(wall, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -138,13 +170,13 @@ class JsonlRecorder:
         with self._lock:
             batch = list(self._buffer)
             self._buffer.clear()
-        if not batch:
+        if not batch or not self.persist:
             return 0
         try:
             os.makedirs(self.directory, exist_ok=True)
             lines_by_path: dict[str, list[str]] = {}
             for rec in batch:
-                nonfinite = _find_nonfinite(rec["data"])
+                nonfinite = _find_nonfinite(rec["data"], "")
                 clean = _sanitize(rec)
                 if nonfinite:
                     clean["nonfinite"] = nonfinite
@@ -220,6 +252,10 @@ def read_records(paths: Iterable[str]) -> Iterator[dict[str, Any]]:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                flagged = rec.get("nonfinite") if isinstance(rec, dict) else None
+                if flagged and isinstance(rec.get("data"), dict):
+                    rec["data"] = _restore(rec["data"], flagged)
+                yield rec

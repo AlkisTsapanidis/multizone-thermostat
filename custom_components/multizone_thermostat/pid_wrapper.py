@@ -84,5 +84,6 @@ class MultizonePID:
             "error": pid.error, "dt": pid.dt, "kp": pid._Kp, "ki": pid._Ki, "kd": pid._Kd,
             "out_min": pid.out_min, "out_max": pid.out_max, "mode": pid.mode,
             "sensor_age": now - self.last_sensor_update,
+            "d_window": pid.derivative_window, "d_limit": pid.derivative_limit,
         }
         return self._last_demand
